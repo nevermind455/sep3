@@ -880,7 +880,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: sell path appends the full PolyApiException
     # (status_code + body) to live_sell_errors.log so an event-feed truncation
     # cannot hide a debuggable rejection. Sell logic itself is unchanged.
-    "polymarket_trade.py": "36de7079632b2ef804cd8671ef8d9d9ecac1b2fa9040fb2b54d51ce8cecaa2a5",
+    # Re-approved 2026-09-04: sell path first queries the wallet's actual
+    # on-chain share balance for the token and caps the FAK size at
+    # min(requested, actual); a dust or zero wallet skips the attempt
+    # entirely. Fixes the ledger-drift hammer where phantom shares triggered
+    # 'not enough balance' every poll. Entry/decision logic is unchanged.
+    "polymarket_trade.py": "59d80dd0e1c85dce160e3aec6a14c647a8a55ed6a9b67243966904291991d54d",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
     "timer.py": "203f04adc9e69d85fadefaefdc05ae06c4929f71138beae2e179ddd7a403718b",

@@ -265,6 +265,27 @@ def _read_balance(client) -> dict | None:
     return _balance_from_response(raw)
 
 
+def _read_share_balance(client, token_id: str) -> float | None:
+    """On-chain share balance for one outcome token, or None on any failure.
+
+    The CLOB refuses a SELL with "not enough balance / allowance" the instant
+    order_amount exceeds the wallet's actual holdings, so sizing the FAK at
+    what the ledger THINKS we own is exactly wrong when the ledger has
+    drifted from chain. Ask the wallet itself and cap the sell at the answer.
+    """
+    try:
+        raw = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL,
+                                   token_id=str(token_id)))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    # `balance` on a CONDITIONAL query is share count in 6-decimal base units;
+    # _pusd_amount does the same divide-by-1e6 and finite/positive checks.
+    return _pusd_amount(raw.get("balance"))
+
+
 def get_balance_allowance() -> dict | None:
     global last_order_error
     # Non-blocking: a queued wait here used to acquire in the gap between
@@ -777,6 +798,48 @@ def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
             if window_end is not None:
                 _validate_round_end(window_end)
             client = _get_client()
+            # The ledger can hold phantom shares - a fill it thinks confirmed
+            # never actually credited on chain, or the operator sold from the
+            # UI. Asking the wallet is the only ground truth. A missing answer
+            # skips the attempt: submitting a size we can't back is the
+            # 'not enough balance' failure this check exists to prevent.
+            actual = _read_share_balance(client, token)
+            if actual is None:
+                last_order_error = ("could not read wallet share balance "
+                                    "for this token; refusing to sell")
+                _append_sell_error_log(
+                    f"token={token[-8:]} size={size:.6f} floor={floor:.4f} "
+                    f"stage=balance_check detail=wallet_balance_query_failed"
+                )
+                print(f"[LIVE] Sell skipped: {last_order_error}")
+                return 0.0
+            # 5 shares is the venue minimum lot the entry path enforces; dust
+            # under that cannot fill a FAK regardless, so save the round trip.
+            _DUST_SHARES = 0.001
+            if actual <= _DUST_SHARES:
+                last_order_error = (
+                    f"wallet holds {actual:.6f} shares of this token "
+                    f"(ledger expected {size:.6f}); nothing to sell")
+                _append_sell_error_log(
+                    f"token={token[-8:]} size={size:.6f} floor={floor:.4f} "
+                    f"stage=balance_check wallet_shares={actual:.6f} "
+                    f"detail=wallet_empty_or_dust"
+                )
+                print(f"[LIVE] Sell skipped: {last_order_error}")
+                return 0.0
+            if actual + 1e-9 < size:
+                # Ledger overstated the position - cap at the ground truth.
+                # Still worth doing: the winning side we want to lock in may
+                # be partly held, and 2 shares at 0.98 is $1.96 that would
+                # otherwise be left on the table.
+                print(f"[LIVE] Sell size capped: ledger {size:.6f} -> "
+                      f"wallet {actual:.6f} shares")
+                _append_sell_error_log(
+                    f"token={token[-8:]} size={size:.6f} floor={floor:.4f} "
+                    f"stage=balance_check wallet_shares={actual:.6f} "
+                    f"detail=size_capped_to_wallet"
+                )
+                size = actual
             mo = MarketOrderArgs(
                 token_id=token,
                 amount=size,             # SELL sizes in SHARES, not USDC
