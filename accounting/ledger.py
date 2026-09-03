@@ -71,6 +71,14 @@ class Lot:
     wall: float
     source: str = ""
     order_id: str | None = None
+    # Shares of this BUY lot already consumed by a later SELL. The lot itself
+    # is never mutated away or removed: `lots` stays an append-only journal of
+    # what actually happened, and FIFO basis is derived from what is left open.
+    consumed: float = 0.0
+
+    @property
+    def open_shares(self) -> float:
+        return max(0.0, self.shares - self.consumed)
 
     @property
     def notional(self) -> float:
@@ -93,6 +101,11 @@ class Position:
     payout_per_share: float | None = None
     realized: float | None = None
     settled_wall: float | None = None
+    # PnL already banked by selling before resolution, net of the fee paid on
+    # the way out. Settlement adds this to the payout on whatever is still
+    # held, so a partially-sold position reports one honest number.
+    realized_from_sales: float = 0.0
+    sell_fees: float = 0.0
 
     @property
     def avg_price(self) -> float | None:
@@ -107,12 +120,16 @@ class Ledger:
     MARKET_WINDOW_SECONDS = MARKET_WINDOW_SECONDS
 
     def __init__(self, path: str | None = None, category: str = "crypto",
-                 fee_resolver=None) -> None:
+                 fee_resolver=None, allow_sells: bool = False) -> None:
         self._lock = threading.RLock()
         self._save_lock = threading.Lock()
         self.path = path or os.environ.get("LEDGER_PATH", "ledger.json")
         self.category = category
         self.fee_resolver = fee_resolver
+        # Exits are opt-in. With this off the ledger keeps its original
+        # contract - buy-and-hold only - so every existing caller behaves
+        # exactly as before and a stray SELL still cannot enter PnL.
+        self.allow_sells = bool(allow_sells)
         self.positions: dict[str, Position] = {}
         self.seen: set[str] = set()          # trade ids, survives restart
         self.skipped_status: int = 0
@@ -285,6 +302,23 @@ class Ledger:
                 return float(price), float(fee_per_share)
         return None
 
+    def open_inventory_for_condition(self, condition_id: str | None) -> dict[str, dict[str, float]]:
+        """Open shares and cost per token for one unsettled market."""
+        condition = str(condition_id or "")
+        if not condition:
+            return {}
+        with self._lock:
+            out: dict[str, dict[str, float]] = {}
+            for position in self.positions.values():
+                if (position.condition_id != condition
+                        or position.settled or position.shares <= 0):
+                    continue
+                out[position.token_id] = {
+                    "shares": float(position.shares),
+                    "cost": float(position.cost),
+                }
+            return out
+
     def recovery_conditions(self, *, now: float | None = None,
                             lookback_s: float = RECOVERY_LOOKBACK_SECONDS,
                             ) -> tuple[str, ...]:
@@ -431,9 +465,14 @@ class Ledger:
                 # RETRYING is not a fill yet; FAILED never was one.
                 self.skipped_status += 1
                 return False
-            if order_side != "BUY":
-                # This strategy never exits on the CLOB. Treating a manual or
-                # unrelated SELL as newly acquired long shares inverts PnL.
+            if order_side == "SELL":
+                if not self.allow_sells:
+                    self.skipped_side += 1
+                    return False
+            elif order_side != "BUY":
+                # Treating an unrelated order as newly acquired long shares
+                # inverts PnL, so anything that is not a recognised side is
+                # refused outright.
                 self.skipped_side += 1
                 return False
             try:
@@ -465,6 +504,44 @@ class Ledger:
                 pos.payout_per_share = None
                 pos.realized = None
                 pos.settled_wall = None
+            if order_side == "SELL":
+                # An exit can only ever reduce inventory we actually hold.
+                # Probing FIFO first means a short is refused before any lot
+                # is mutated, so a rejected sell leaves the ledger untouched.
+                available = sum(l.open_shares for l in pos.lots
+                                if str(l.side or "").upper() == "BUY")
+                if sh > available + 1e-9 or sh > pos.shares + 1e-9:
+                    self.skipped_side += 1
+                    return False
+                notional_basis, fee_basis, shortfall = _consume_fifo(pos, sh)
+                if shortfall > 1e-9:
+                    # Unreachable given the check above; refuse rather than
+                    # book a partially-consumed sale if it ever is reached.
+                    self.skipped_side += 1
+                    return False
+                basis = notional_basis + fee_basis
+                proceeds = sh * px - f
+                pos.lots.append(Lot(tid, token, condition, order_side,
+                                    sh, px, f, st, time.time(), source_text,
+                                    order_text))
+                pos.shares -= sh
+                pos.cost -= basis
+                pos.fees -= fee_basis
+                pos.sell_fees += f
+                pos.realized_from_sales += proceeds - basis
+                if pos.shares <= 1e-9:
+                    # Nothing left to resolve. Close it here, or settlement -
+                    # which only visits positions still holding shares - would
+                    # never report the PnL banked by the sales.
+                    pos.shares = 0.0
+                    pos.cost = 0.0
+                    pos.fees = 0.0
+                    pos.settled = True
+                    pos.payout_per_share = None
+                    pos.realized = pos.realized_from_sales
+                    pos.settled_wall = time.time()
+                self.seen.add(tid)
+                return True
             pos.lots.append(Lot(tid, token, condition, order_side,
                                 sh, px, f, st, time.time(), source_text,
                                 order_text))
@@ -616,7 +693,8 @@ class Ledger:
                 for pos in targets:
                     pay = payouts[pos.token_id]
                     pos.payout_per_share = pay
-                    pos.realized = pos.shares * pay - pos.cost
+                    pos.realized = (pos.shares * pay - pos.cost
+                                    + pos.realized_from_sales)
                     pos.settled = True
                     pos.settled_wall = settled_wall
                     done.append(pos)
@@ -737,6 +815,8 @@ class Ledger:
             out["unrealized_mark_to_bid"] = None
             out["equity_pnl"] = None
             out["mark_error"] = None
+        out["round_books"] = _round_books_from_open(
+            out["open_position_details"], marked=mark is not None)
         return out
 
     # --------------------------------------------------- accuracy check
@@ -1016,6 +1096,33 @@ class Ledger:
             return False
 
 
+def _consume_fifo(pos, shares: float):
+    """Consume `shares` from the oldest open BUY lots, oldest first.
+
+    Returns ``(notional_basis, fee_basis, shortfall)``. A non-zero shortfall
+    means the position does not hold that many shares, and the caller must
+    refuse the fill rather than book a short: this ledger has no concept of
+    negative inventory and inventing one would invert PnL.
+    """
+    remaining = float(shares)
+    notional = fees = 0.0
+    for lot in pos.lots:
+        if remaining <= 1e-12:
+            break
+        if str(lot.side or "").upper() != "BUY":
+            continue
+        open_sh = lot.open_shares
+        if open_sh <= 1e-12:
+            continue
+        take = min(open_sh, remaining)
+        fee_per_share = (lot.fee / lot.shares) if lot.shares else 0.0
+        notional += take * lot.price
+        fees += take * fee_per_share
+        lot.consumed += take
+        remaining -= take
+    return notional, fees, remaining
+
+
 def _pos_dict(p: Position) -> dict:
     d = asdict(p)
     d["lots"] = [asdict(l) for l in p.lots]
@@ -1162,6 +1269,116 @@ def _conservative_authorization_cost(metadata: dict) -> float:
     return value
 
 
+def _round_books_from_open(details: list, *, marked: bool) -> list[dict]:
+    """Group open legs by market and combine complementary UP/DOWN inventory.
+
+    A 5-minute Up/Down market is one binary. Matched shares redeem $1.00 per
+    pair at settlement; leftover shares stay directional and mark to the bid.
+    """
+    groups: dict[str, list[dict]] = {}
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        token = str(detail.get("token_id") or "")
+        if not token:
+            continue
+        key = str(detail.get("condition_id") or f"token:{token}")
+        groups.setdefault(key, []).append(detail)
+    books = [
+        _combine_round_legs(condition_id, legs, marked=marked)
+        for condition_id, legs in groups.items()
+    ]
+    books.sort(key=lambda item: str(item.get("condition_id") or ""))
+    return books
+
+
+def _combine_round_legs(condition_id: str, legs: list[dict], *,
+                        marked: bool) -> dict:
+    round_cost = sum(float(leg.get("cost") or 0.0) for leg in legs)
+    total_shares = sum(float(leg.get("shares") or 0.0) for leg in legs)
+    unmarkable = 0
+    round_mark = 0.0
+    live = 0.0
+    all_marked = marked and bool(legs)
+    for leg in legs:
+        shares = float(leg.get("shares") or 0.0)
+        bid = leg.get("mark_bid") if marked else None
+        if not marked:
+            continue
+        if bid is None:
+            unmarkable += 1
+            all_marked = False
+            continue
+        round_mark += shares * float(bid)
+        u = leg.get("unrealized_to_bid")
+        live += float(u) if u is not None else shares * float(bid) - float(leg.get("cost") or 0.0)
+
+    matched = 0.0
+    leftover_shares = 0.0
+    leftover_token_id = None
+    leftover_cost = None
+    leftover_pnl = None
+    pair_entry = None
+    pair_entry_with_fees = None
+    pair_mark = None
+    locked_pnl = None
+    if len(legs) == 2:
+        a, b = legs[0], legs[1]
+        sa = float(a.get("shares") or 0.0)
+        sb = float(b.get("shares") or 0.0)
+        ca = float(a.get("cost") or 0.0)
+        cb = float(b.get("cost") or 0.0)
+        if sa > 0.0 and sb > 0.0:
+            matched = min(sa, sb)
+            pair_entry_with_fees = (ca / sa) + (cb / sb)
+            pa, pb = a.get("average_entry_price"), b.get("average_entry_price")
+            if pa is not None and pb is not None:
+                pair_entry = float(pa) + float(pb)
+            if matched > 0.0:
+                locked_pnl = matched * 1.0 - matched * pair_entry_with_fees
+            if sa > sb + 1e-12:
+                leftover_shares = sa - sb
+                leftover_token_id = a.get("token_id")
+                leftover_cost = leftover_shares * (ca / sa)
+            elif sb > sa + 1e-12:
+                leftover_shares = sb - sa
+                leftover_token_id = b.get("token_id")
+                leftover_cost = leftover_shares * (cb / sb)
+            ba, bb = (a.get("mark_bid"), b.get("mark_bid")) if marked else (None, None)
+            if ba is not None and bb is not None:
+                pair_mark = float(ba) + float(bb)
+            if leftover_shares > 0.0 and leftover_cost is not None:
+                leftover_leg = a if a.get("token_id") == leftover_token_id else b
+                lb = leftover_leg.get("mark_bid") if marked else None
+                if lb is not None:
+                    leftover_pnl = leftover_shares * float(lb) - leftover_cost
+    elif len(legs) == 1:
+        leftover_shares = float(legs[0].get("shares") or 0.0)
+        leftover_token_id = legs[0].get("token_id")
+        leftover_cost = float(legs[0].get("cost") or 0.0)
+        leftover_pnl = legs[0].get("unrealized_to_bid") if marked else None
+
+    return {
+        "condition_id": condition_id if not str(condition_id).startswith("token:")
+        else None,
+        "legs": legs,
+        "total_shares": total_shares,
+        "matched_shares": matched,
+        "leftover_shares": leftover_shares,
+        "leftover_token_id": leftover_token_id,
+        "leftover_cost": leftover_cost,
+        "leftover_pnl": leftover_pnl,
+        "round_cost": round_cost,
+        "round_mark": round_mark if all_marked else None,
+        "live_pnl": live if all_marked else None,
+        "pair_entry": pair_entry,
+        "pair_entry_with_fees": pair_entry_with_fees,
+        "pair_mark": pair_mark,
+        "locked_pnl": locked_pnl,
+        "unmarkable_legs": unmarkable,
+    }
+
+
 def _safe_mark(mark, token_id: str) -> tuple[float | None, str | None]:
     try:
         raw = mark(token_id)
@@ -1222,11 +1439,12 @@ def _validate_loaded_position(key: str, position: Position) -> None:
     seen_lots: set[str] = set()
     shares = cost = fees = 0.0
     for lot in position.lots:
+        lot_side = str(lot.side).upper()
         if (not lot.trade_id or lot.trade_id in seen_lots
                 or not _safe_identifier(lot.trade_id)
                 or str(lot.token_id) != key
                 or lot.condition_id != position.condition_id
-                or str(lot.side).upper() != "BUY"
+                or lot_side not in ("BUY", "SELL")
                 or str(lot.status).upper() != "CONFIRMED"):
             raise ValueError("invalid persisted lot identity")
         if (not isinstance(lot.source, str) or len(lot.source) > 256
@@ -1234,30 +1452,55 @@ def _validate_loaded_position(key: str, position: Position) -> None:
                 or (lot.order_id is not None and not _safe_identifier(lot.order_id))):
             raise ValueError("invalid persisted lot metadata")
         seen_lots.add(lot.trade_id)
-        numeric = (lot.shares, lot.price, lot.fee, lot.wall)
+        numeric = (lot.shares, lot.price, lot.fee, lot.wall, lot.consumed)
         if (any(not isinstance(value, (int, float)) or not math.isfinite(value)
                 for value in numeric)
                 or lot.shares <= 0 or not 0 < lot.price <= 1
-                or lot.fee < 0 or lot.wall <= 0):
+                or lot.fee < 0 or lot.wall <= 0
+                or lot.consumed < 0 or lot.consumed > lot.shares + 1e-9):
             raise ValueError("invalid persisted lot amount")
-        shares += lot.shares
-        fees += lot.fee
-        cost += lot.cost
+        if lot_side == "SELL":
+            # A sale is journalled but holds nothing: its PnL was banked into
+            # realized_from_sales when it happened, and the BUY lots it
+            # consumed already carry the reduction. Counting it into the
+            # aggregates here would double-count the exit.
+            if lot.consumed:
+                raise ValueError("a SELL lot cannot itself be consumed")
+            continue
+        open_shares = lot.shares - lot.consumed
+        fee_per_share = (lot.fee / lot.shares) if lot.shares else 0.0
+        open_fee = fee_per_share * open_shares
+        shares += open_shares
+        fees += open_fee
+        cost += open_shares * lot.price + open_fee
     tolerance = 1e-8
     if (abs(position.shares - shares) > tolerance
             or abs(position.fees - fees) > tolerance
             or abs(position.cost - cost) > tolerance):
         raise ValueError("position aggregates do not match lots")
+    for value in (position.realized_from_sales, position.sell_fees):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("invalid position sales amount")
+    if position.sell_fees < 0:
+        raise ValueError("invalid position sales amount")
     if position.settled:
         payout = position.payout_per_share
         realized = position.realized
-        if (not isinstance(payout, (int, float)) or not math.isfinite(payout)
-                or not 0 <= payout <= 1
-                or not isinstance(realized, (int, float)) or not math.isfinite(realized)
-                or abs(realized - (position.shares * payout - position.cost)) > tolerance
+        if (not isinstance(realized, (int, float)) or not math.isfinite(realized)
                 or not isinstance(position.settled_wall, (int, float))
                 or not math.isfinite(position.settled_wall)
                 or position.settled_wall <= 0):
+            raise ValueError("invalid settled position")
+        if payout is None:
+            # Closed by selling out rather than by resolution: there is no
+            # payout, and everything realised came from the sales.
+            if (position.shares > tolerance
+                    or abs(realized - position.realized_from_sales) > tolerance):
+                raise ValueError("invalid settled position")
+        elif (not isinstance(payout, (int, float)) or not math.isfinite(payout)
+                or not 0 <= payout <= 1
+                or abs(realized - (position.shares * payout - position.cost
+                                   + position.realized_from_sales)) > tolerance):
             raise ValueError("invalid settled position")
     elif (position.payout_per_share is not None or position.realized is not None
           or position.settled_wall is not None):

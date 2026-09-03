@@ -95,7 +95,7 @@ async def record(interval: float) -> int:
             if new:
                 writer.writeheader()
             while True:
-                now = timer.wall()
+                now = timer.unix()
                 window = timer.window_start(now)
                 secs_left = window + 300 - now
                 tokens = market_discovery.get_tokens_for_current_round(window)

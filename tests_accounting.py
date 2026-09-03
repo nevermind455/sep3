@@ -621,6 +621,83 @@ def t_unrealized_marks_to_bid_and_flags_unmarkable():
         os.path.exists(path) and os.unlink(path)
 
 
+def t_round_book_combines_both_legs_and_marks_live_pnl():
+    led, path = _ledger()
+    try:
+        check("up fill recorded",
+              led.record_fill("u1", UP_TOK, shares=10.0, price=0.40,
+                              condition_id=COND))
+        check("down fill recorded",
+              led.record_fill("d1", DN_TOK, shares=5.0, price=0.55,
+                              condition_id=COND))
+        up, dn = led.positions[UP_TOK], led.positions[DN_TOK]
+        marks = {UP_TOK: 0.51, DN_TOK: 0.48}
+        s = led.summary(mark=lambda token: marks.get(token))
+        check("one combined round book", len(s["round_books"]) == 1, str(s["round_books"]))
+        book = s["round_books"][0]
+        check("grouped by condition", book["condition_id"] == COND, str(book))
+        check("matched pairs are the short leg",
+              approx(book["matched_shares"], 5.0), str(book["matched_shares"]))
+        check("leftover is the unmatched up shares",
+              approx(book["leftover_shares"], 5.0)
+              and book["leftover_token_id"] == UP_TOK, str(book))
+        check("round cost is both legs",
+              approx(book["round_cost"], up.cost + dn.cost), str(book["round_cost"]))
+        live = 10.0 * 0.51 + 5.0 * 0.48 - (up.cost + dn.cost)
+        check("live pnl is combined mark-to-bid",
+              approx(book["live_pnl"], live), str(book["live_pnl"]))
+        check("pair entry is both average fills",
+              approx(book["pair_entry"], 0.40 + 0.55), str(book["pair_entry"]))
+        paid = (up.cost / 10.0) + (dn.cost / 5.0)
+        check("fee-inclusive pair price",
+              approx(book["pair_entry_with_fees"], paid),
+              str(book["pair_entry_with_fees"]))
+        check("pair mark is both bids",
+              approx(book["pair_mark"], 0.51 + 0.48), str(book["pair_mark"]))
+        locked = 5.0 * (1.0 - paid)
+        check("locked pnl uses $1 settlement on matched shares",
+              approx(book["locked_pnl"], locked), str(book["locked_pnl"]))
+        check("no unmarkable legs", book["unmarkable_legs"] == 0, str(book))
+
+        one_side = led.summary(mark=lambda token: 0.51 if token == UP_TOK else None)
+        partial = one_side["round_books"][0]
+        check("a missing bid withholds combined live pnl",
+              partial["live_pnl"] is None, str(partial))
+        check("unmarkable legs counted",
+              partial["unmarkable_legs"] == 1, str(partial))
+        check("locked settlement pnl does not need a bid",
+              approx(partial["locked_pnl"], locked), str(partial["locked_pnl"]))
+
+        unmarked = led.summary()
+        raw = unmarked["round_books"][0]
+        check("without a mark function live pnl stays unknown",
+              raw["live_pnl"] is None, str(raw))
+        check("pair price is still available without a mark",
+              approx(raw["pair_entry"], 0.95), str(raw["pair_entry"]))
+    finally:
+        os.path.exists(path) and os.unlink(path)
+
+
+def t_round_book_one_sided_leftover_is_the_whole_leg():
+    led, path = _ledger()
+    try:
+        led.record_fill("u1", UP_TOK, shares=4.0, price=0.50, condition_id=COND)
+        cost = led.positions[UP_TOK].cost
+        s = led.summary(mark=lambda token: 0.60)
+        book = s["round_books"][0]
+        check("no matched pairs on one leg",
+              approx(book["matched_shares"], 0.0), str(book))
+        check("leftover is the open up shares",
+              approx(book["leftover_shares"], 4.0)
+              and book["leftover_token_id"] == UP_TOK, str(book))
+        check("one-sided live pnl equals the token mark",
+              approx(book["live_pnl"], 4.0 * 0.60 - cost), str(book["live_pnl"]))
+        check("pair fields stay empty",
+              book["pair_entry"] is None and book["locked_pnl"] is None, str(book))
+    finally:
+        os.path.exists(path) and os.unlink(path)
+
+
 def t_ledger_survives_restart_without_recounting():
     led, path = _ledger()
     try:

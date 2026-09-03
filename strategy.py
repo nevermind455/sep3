@@ -24,3 +24,30 @@ def final_decision(price_side, book_side, chainlink_side):
     if chainlink_side and chainlink_side in (price_side, book_side):
         return chainlink_side
     return price_side or book_side or chainlink_side
+
+
+def minority_decision(price_side, book_side, chainlink_side):
+    """Follow the DISSENTING signal when the three disagree.
+
+    Two votes for UP and one for DOWN selects DOWN. Unanimity selects the
+    agreed side, because there is no dissent to follow. Neutral or missing
+    signals do not vote: a signal that abstained has not disagreed with
+    anything, and treating silence as dissent would invent a direction.
+
+    A 1-1 split has no minority, so it returns None and the caller abstains
+    rather than breaking the tie arbitrarily.
+    """
+    votes = [s for s in (price_side, book_side, chainlink_side)
+             if s in ("UP", "DOWN")]
+    if not votes:
+        return None
+    if len(set(votes)) == 1:
+        # Unanimous (including a lone vote): nobody dissented, so the agreed
+        # side stands. Without this the majority test below inverts a clean
+        # 3-0 into its opposite.
+        return votes[0]
+    up = votes.count("UP")
+    down = len(votes) - up
+    if up == down:
+        return None
+    return "DOWN" if up > down else "UP"

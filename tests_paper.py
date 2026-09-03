@@ -198,6 +198,29 @@ def t_paper_sizes_up_to_venue_minimum():
               str(broker.last_fill))
 
 
+def t_paper_sizes_up_when_top_of_book_cannot_fill_the_minimum():
+    """$2.50 at a 0.50 best ask is 5 shares only if that level has the size.
+
+    A 3-share top and the rest at 0.51 is the live btc-updown-5m case that
+    produced `order size 4.959885 shares is below venue minimum 5`.
+    """
+    thin = BookSnapshot(
+        "up", ((D("0.50"), D("3")), (D("0.51"), D("10"))),
+        min_order_size=D("5"), tick_size=D("0.01"),
+        timestamp=str(int(time.time() * 1000)),
+        book_hash="thin", received_wall=time.time(), best_bid=D("0.49"))
+    sized = size_to_venue_minimum(2.50, thin, rules(minimum=5), 0.90)
+    check("thin top of book sizes up past best-ask notional",
+          sized == D("2.52"), str(sized))
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, selected_book=thin, selected_rules=rules(minimum=5))
+        check("thin-book FOK fills after sizing up",
+              paper_order(broker, amount=2.50) is True, broker.last_error)
+        check("filled shares meet the venue minimum",
+              broker.last_fill["shares"] >= 5,
+              str(broker.last_fill))
+
+
 def t_paper_uses_live_ws_asks_when_rest_is_empty():
     view = types.SimpleNamespace(
         token="up", status="LIVE", asks=((0.76, 50.0),),
@@ -581,19 +604,15 @@ def t_background_settlement_credits_cash_once_and_survives_reload():
 
 
 def t_execution_window_covers_every_enabled_phase():
-    """A phase-1 order arrives ~4 minutes before phase 2's window opens.
+    """A phase-2 order lands inside the round's execution interval.
 
-    The broker refuses anything outside the round's execution interval, so
-    sizing that interval from TRADE_LAST_SECONDS alone rejects every phase-1
-    submission before it can reach a book. That failure is invisible to a loop
-    test that stubs place_trade, which is exactly how it shipped.
+    The broker refuses anything outside the interval, so the interval has to
+    match the phase 2 the loop actually runs. That failure is invisible to a
+    loop test that stubs place_trade.
     """
     import config
 
-    check("the execution window reaches phase 1's first second",
-          config.EXECUTION_WINDOW_SECONDS >= config.PHASE1_START_SECONDS,
-          f"{config.EXECUTION_WINDOW_SECONDS} < {config.PHASE1_START_SECONDS}")
-    check("and still covers phase 2",
+    check("the execution window covers phase 2",
           config.EXECUTION_WINDOW_SECONDS >= config.TRADE_LAST_SECONDS,
           str(config.EXECUTION_WINDOW_SECONDS))
 
@@ -605,14 +624,15 @@ def t_execution_window_covers_every_enabled_phase():
         # Size the interval the way run_feeds does.
         broker.trade_window_seconds = float(config.EXECUTION_WINDOW_SECONDS)
         end = round_end()
-        original = timer_mod.wall
-        # Stand at the top of the round, where phase 1 trades and phase 2
-        # has not opened yet.
-        sampled = end - 290.0
+        original_unix = timer_mod.unix
+        original_wall = timer_mod.wall
+        # Stand inside phase 2's trading window.
+        sampled = end - min(config.TRADE_LAST_SECONDS - 1.0, 60.0)
+        timer_mod.unix = lambda *_a, **_k: sampled
         timer_mod.wall = lambda *_a, **_k: sampled
         try:
-            # Freshness is measured against timer.wall(), so a book stamped
-            # with real time.time() looks ~5 minutes in the future here.
+            # Interval uses Unix; book freshness uses CLOB wall. Keep them
+            # on the same synthetic clock so this is an interval test.
             broker._book_fetch = lambda token: replace(
                 book(),
                 timestamp=str(int(sampled * 1000)),
@@ -620,19 +640,20 @@ def t_execution_window_covers_every_enabled_phase():
             )
             accepted = paper_order(broker, amount=2.5, end=end)
         finally:
-            timer_mod.wall = original
-        check("a phase-1 timestamp is not refused as out-of-interval",
+            timer_mod.unix = original_unix
+            timer_mod.wall = original_wall
+        check("a phase-2 timestamp is not refused as out-of-interval",
               "outside the current round execution interval"
               not in (broker.last_error or ""), str(broker.last_error))
-        check("a phase-1 order fills against a contemporaneous book",
+        check("a phase-2 order fills against a contemporaneous book",
               accepted is True, broker.last_error)
 
-        # And the guard still bites outside every phase.
-        timer_mod.wall = lambda *_a, **_k: end - 900.0
+        # And the guard still bites outside the round.
+        timer_mod.unix = lambda *_a, **_k: end - 900.0
         try:
             paper_order(broker, amount=2.5, end=end)
         finally:
-            timer_mod.wall = original
+            timer_mod.unix = original_unix
         check("a timestamp before the round still is refused",
               "outside the current round execution interval"
               in (broker.last_error or ""), str(broker.last_error))

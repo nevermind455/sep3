@@ -68,3 +68,15 @@ live_diagnostics.log
 # record, and not something a public repo should carry.
 *_decisions.csv
 live_activity.json
+
+# Local scratch/state files written by ad-hoc scripts and by the bot's own
+# runtime caches. These carry live-wallet positions, market snapshots and
+# signal journal state; the *_ledger.json pattern above misses these because
+# they use short unqualified names.
+_ledgers.json
+_sig.json
+act.json
+all_mkts.json
+mkt.json
+pos.json
+live_sell_errors.log

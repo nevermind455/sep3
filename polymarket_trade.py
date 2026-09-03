@@ -25,6 +25,10 @@ from py_clob_client_v2 import (
 _client = None
 _live_disabled = False
 _execution_lock = threading.Lock()
+# Exits take their own lock for the same reason PAPER does: an exit blocking an
+# entry costs the whole trade cycle, and the two are not duplicates of one
+# another.
+_exit_lock = threading.Lock()
 _state_lock = threading.RLock()
 _order_observer = None
 _journal_fault = None
@@ -449,9 +453,10 @@ def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
 def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
     """Raise a dollar stake just enough to buy the venue's minimum shares.
 
-    Mirrors paper_trade.size_to_venue_minimum. Returns the stake unchanged
-    whenever it cannot verify a raise is needed - a missing book, an unusable
-    best ask, or one above the price cap - so an unreadable market can never
+    Mirrors paper_trade.size_to_venue_minimum, including a walk of the
+    executable asks. Best-ask * minimum under-sizes when the top of book
+    cannot fill 5 shares by itself. Returns the stake unchanged whenever
+    it cannot verify a raise is needed, so an unreadable market can never
     silently enlarge a live order.
     """
     try:
@@ -459,11 +464,27 @@ def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
         minimum = Decimal(str(rules["minimum"]))
         if minimum <= 0 or not asks:
             return float(wanted)
-        best = Decimal(str(asks[0]["price"]))
         ceiling = Decimal(str(cap))
+        best = Decimal(str(asks[0]["price"]))
         if best <= 0 or best > ceiling:
             return float(wanted)
-        required = (minimum * best).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        remaining = minimum
+        notional = Decimal("0")
+        for level in asks:
+            price = Decimal(str(level["price"]))
+            available = Decimal(str(level["size"]))
+            if price <= 0 or price > ceiling or available <= 0:
+                if price > ceiling:
+                    break
+                continue
+            take = remaining if remaining <= available else available
+            notional += take * price
+            remaining -= take
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            return float(wanted)
+        required = notional.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         return float(wanted if wanted >= required else required)
     except (InvalidOperation, KeyError, TypeError, ValueError):
         return float(amount)
@@ -595,17 +616,38 @@ def _quote_fok(asks, amount: Decimal, limit: Decimal,
     return shares, fee.quantize(FEE_PRECISION, rounding=ROUND_HALF_UP)
 
 
-def _validate_round_end(window_end) -> float:
+def _validate_round_end(window_end, *, min_expiry=None) -> float:
     try:
         end = float(window_end)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("missing current round end timestamp") from exc
     now = time.time()
+    floor = config.MIN_SECONDS_TO_EXPIRY
+    if min_expiry is not None:
+        if not config.LATE_TRIM_ENABLED:
+            raise RuntimeError("late trim is disabled")
+        try:
+            floor = float(min_expiry)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("late trim expiry floor is invalid") from exc
+        if abs(floor - config.LATE_TRIM_CUTOFF_SECONDS) > 1e-9:
+            raise RuntimeError("late trim must use LATE_TRIM_CUTOFF_SECONDS")
     if (int(end) % 300 != 0
             or not end - config.EXECUTION_WINDOW_SECONDS <= now
-            or not now < end - config.MIN_SECONDS_TO_EXPIRY):
+            or not now < end - floor):
         raise RuntimeError("order is outside the current round execution interval")
     return end
+
+
+def _checked_round_end(window_end, min_expiry=None) -> float:
+    """Call _validate_round_end without a min_expiry kwarg on the normal path.
+
+    Tests and older stubs replace `_validate_round_end` with a one-argument
+    function. Passing `min_expiry=None` would still be a keyword they reject.
+    """
+    if min_expiry is None:
+        return _validate_round_end(window_end)
+    return _validate_round_end(window_end, min_expiry=min_expiry)
 
 
 def _mark_ambiguous(condition_id: str, window_end: float,
@@ -674,16 +716,121 @@ def _pre_submit_guard_error(pre_submit_guard) -> str | None:
     return None
 
 
+def _append_sell_error_log(payload: str) -> None:
+    """Append one sell-failure line to live_sell_errors.log.
+
+    The event-feed panel truncates at column width, so a rich error string
+    ("PolyApiException[status_code=400, error_message={not enough balance}]")
+    shows only its first ~40 characters. Persisting the untruncated text to a
+    dedicated file gives the operator something to grep after the fact - the
+    ledger's fault counters name only that the failure happened, never why.
+    """
+    try:
+        from pathlib import Path
+        import time as _time
+        log_path = Path(__file__).resolve().parent / "live_sell_errors.log"
+        stamp = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime())
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] {payload}\n")
+    except Exception:
+        # A logging failure must never abort the sell path.
+        pass
+
+
+def sell_shares(token_id: str, shares: float, *, min_price: float = 0.0,
+                condition_id: str | None = None,
+                window_end: float | None = None) -> float:
+    """Live FAK exit. Returns shares submitted, or 0.0 if nothing was sent.
+
+    FAK, not FOK: an exit fills against whatever the book holds and cancels the
+    rest. FOK would refuse the whole order whenever the full size is not
+    resting at once, which is the normal state of the book a stop sells into -
+    it is thin precisely because the position has already gone wrong.
+
+    This deliberately does NOT reuse the entry preflight. That path exists to
+    stop us BUYING into resolution and checks USDC balance, round window and
+    price ceilings; none of it protects an exit, and some of it would block one
+    at exactly the moment a stop needs to act.
+    """
+    global last_order_error
+    if _live_disabled:
+        last_order_error = "live execution is disabled by paper mode"
+        return 0.0
+    token = str(token_id or "")
+    if not _valid_token(token):
+        last_order_error = "invalid token id"
+        return 0.0
+    try:
+        size = float(shares)
+        floor = float(min_price)
+    except (TypeError, ValueError):
+        last_order_error = "invalid sell size or floor"
+        return 0.0
+    if not math.isfinite(size) or size <= 0 or not 0.0 <= floor < 1.0:
+        last_order_error = "invalid sell size or floor"
+        return 0.0
+    if not _exit_lock.acquire(timeout=_API_LOCK_WAIT_SECONDS):
+        last_order_error = "timed out waiting for the live API"
+        return 0.0
+    try:
+        try:
+            if window_end is not None:
+                _validate_round_end(window_end)
+            client = _get_client()
+            mo = MarketOrderArgs(
+                token_id=token,
+                amount=size,             # SELL sizes in SHARES, not USDC
+                side=Side.SELL,
+                price=floor,
+                order_type=OrderType.FAK,
+            )
+            # No PartialCreateOrderOptions: the entry path derives tick/neg_risk
+            # from a validated UP/DOWN mapping it already holds, and an exit has
+            # only the one token. Letting the client resolve them from the token
+            # is correct here and avoids asserting a mapping we cannot check.
+            signed = client.create_market_order(mo)
+            resp = client.post_order(signed, OrderType.FAK)
+        except Exception as exc:
+            last_order_error = _safe_error(exc)
+            # The event-feed line clips at panel width; capture the full
+            # exception text (status_code, body) on disk so the failure is
+            # actually debuggable after the fact.
+            _append_sell_error_log(
+                f"token={token[-8:]} size={size:.6f} floor={floor:.4f} "
+                f"stage=submit exc={type(exc).__name__} detail={exc!s}"
+            )
+            print(f"[LIVE] Sell failed: {last_order_error}")
+            return 0.0
+        oid, status, err = _accepted_order_response(resp)
+        if err is not None:
+            last_order_error = _safe_error(err)
+            _append_sell_error_log(
+                f"token={token[-8:]} size={size:.6f} floor={floor:.4f} "
+                f"stage=response status={status} detail={err!s}"
+            )
+            print(f"[LIVE] Sell rejected: {last_order_error}")
+            return 0.0
+        last_order_error = None
+        print(f"[LIVE] Sell submitted: {size:.6f} sh floor {floor:.4f} "
+              f"status={status} id={str(oid)[-12:]}")
+        return size
+    finally:
+        _exit_lock.release()
+
+
 def place_trade(side: str, amount: float, up_token_id: str | None = None,
                 down_token_id: str | None = None,
                 condition_id: str | None = None,
                 window_end: float | None = None,
-                max_price: float | None = None, *, pre_submit_guard=None) -> bool:
+                max_price: float | None = None, *, pre_submit_guard=None,
+                min_expiry: float | None = None) -> bool:
     """Serialize live submissions so two callers cannot duplicate an entry.
 
     `max_price` caps this order alone, and may only tighten MAX_BUY_PRICE.
     `pre_submit_guard`, when supplied, must return literal ``True`` immediately
     before each signing/POST boundary.  It may reject, but never changes side.
+    `min_expiry` may lower the last-minute floor to LATE_TRIM_CUTOFF_SECONDS
+    when late trim is enabled; it cannot open T-0.
     """
     global last_order_error
     # Wait out a short in-flight balance/cancel HTTP. Failing immediately made
@@ -694,7 +841,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
     try:
         return _place_trade(side, amount, up_token_id, down_token_id,
                             condition_id, window_end, max_price,
-                            pre_submit_guard=pre_submit_guard)
+                            pre_submit_guard=pre_submit_guard,
+                            min_expiry=min_expiry)
     finally:
         _execution_lock.release()
 
@@ -703,7 +851,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                  down_token_id: str | None = None,
                  condition_id: str | None = None,
                  window_end: float | None = None,
-                 max_price: float | None = None, *, pre_submit_guard=None) -> bool:
+                 max_price: float | None = None, *, pre_submit_guard=None,
+                 min_expiry: float | None = None) -> bool:
     global last_order_error, last_order_status, last_order_receipt, _journal_fault
     last_order_error = None
     last_order_status = None
@@ -742,7 +891,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
     token_id = str(up_token_id if side == "UP" else down_token_id)
 
     try:
-        end = _validate_round_end(window_end)
+        end = _checked_round_end(window_end, min_expiry)
         if _ambiguous_blocks(condition_id, token_id):
             raise RuntimeError(
                 "prior submission of this outcome has an ambiguous result; "
@@ -805,7 +954,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         if funds["allowance"] + 1e-9 < total_cost:
             raise RuntimeError(
                 f"insufficient pUSD allowance (${funds['allowance']:.6f} < ${total_cost:.6f} incl fee)")
-        _validate_round_end(end)
+        _checked_round_end(end, min_expiry)
     except Exception as exc:
         last_order_error = _safe_error(exc)
         print(f"[LIVE] Order preflight failed: {last_order_error}")
@@ -820,7 +969,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             print(f"[LIVE] Order blocked before signing: {last_order_error}")
             return False
         try:
-            _validate_round_end(end)
+            _checked_round_end(end, min_expiry)
             options = PartialCreateOrderOptions(
                 tick_size=str(rules["tick"]), neg_risk=rules["neg_risk"])
             mo = MarketOrderArgs(
@@ -832,7 +981,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                 user_usdc_balance=funds["balance"],
             )
             signed = client.create_market_order(mo, options=options)
-            _validate_round_end(end)
+            _checked_round_end(end, min_expiry)
         except Exception as exc:
             last_order_error = _safe_error(exc)
             print(f"[LIVE] Order signing failed: {last_order_error}")

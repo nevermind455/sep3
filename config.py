@@ -58,12 +58,11 @@ def _env_bool(name: str, default: bool | None = False) -> bool | None:
     raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, on/off")
 
 SYMBOL = "BTCUSDT"
-# $2.50 is not a round number by accident: the venue minimum is 5 shares, and
-# at the top of the phase-1 band (0.50) that is exactly $2.50. Anything less
-# and the engine sizes the order up at the most expensive price in the band.
-# It is also the largest size whose bad-case drawdown fits the paper balance.
+# $2.50 is the largest size whose bad-case drawdown fits the paper balance.
+# The engine sizes UP to the 5-share venue minimum, so a fill above BET_SIZE/5
+# costs more than BET_SIZE - MAX_ROUND_EXPOSURE caps the real cash.
 BET_SIZE = _env_float("BET_SIZE", "2.50")
-# Phase 2 owns the final stretch only; phase 1 owns everything before it.
+# Phase 2 trades inside the final TRADE_LAST_SECONDS of each round.
 TRADE_LAST_SECONDS = _env_int("TRADE_LAST_SECONDS", "120")
 if TRADE_LAST_SECONDS is None:
     raise ValueError("TRADE_LAST_SECONDS cannot be empty")
@@ -97,86 +96,20 @@ TWAP_STALE_AFTER = _env_float("TWAP_STALE_AFTER", "10.0")
 # Trading T-120..T-60 was +1.4 per $100 over the same period; the damage was
 # entirely in the tail.
 MIN_SECONDS_TO_EXPIRY = _env_float("MIN_SECONDS_TO_EXPIRY", "60.0")
-# ---- phase 1: price band, with direction authorized by fresh SIG PRICE -----
-# The band controls whether the selected contract is affordable.  Binance
-# opening-to-current direction controls which outcome may be submitted; a
-# neutral, stale, or opposite signal now fails closed.
-PHASE1_ENABLED = bool(_env_bool("PHASE1_ENABLED", True))
-PHASE1_INTERVAL_SECONDS = _env_float("PHASE1_INTERVAL_SECONDS", "12")
-# Bands are per sub-window: "start:end:low:high[:interval]", seconds REMAINING
-# in the round, comma separated, listed from the open toward expiry. Each band
-# caps its own orders, so a thin top level can never fill outside the band
-# being measured - one global cap cannot bound several ranges. The optional
-# fifth field sets that window's own cadence; without it the band uses
-# PHASE1_INTERVAL_SECONDS.
-#
-# The final band covers the same T-120..T-60 interval as phase 2. Measured
-# across 89 observations it won 68.5% needing 66.8% (+3.7 per $100, z=+0.66)
-# - fair value.  The band and Phase 2 retain different entry conditions, but
-# every order side is now authorized by the same fresh Binance SIG PRICE.
-PHASE1_BANDS_RAW = _env_text(
-    "PHASE1_BANDS",
-    "300:240:0.35:0.45,240:180:0.30:0.40,180:120:0.40:0.50,120:60:0.55:0.75:8")
 
-
-def _parse_bands(raw: str):
-    bands = []
-    for chunk in str(raw).split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        parts = chunk.split(":")
-        if len(parts) not in (4, 5):
-            raise ValueError(
-                f"PHASE1_BANDS entry {chunk!r} must be start:end:low:high[:interval]")
-        try:
-            start, end = int(parts[0]), int(parts[1])
-            low, high = float(parts[2]), float(parts[3])
-            interval = float(parts[4]) if len(parts) == 5 else None
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"PHASE1_BANDS entry {chunk!r} is not numeric") from exc
-        if not 0 <= end < start <= 300:
-            raise ValueError(
-                f"PHASE1_BANDS entry {chunk!r} needs 0 <= end < start <= 300")
-        if not (math.isfinite(low) and math.isfinite(high) and 0 < low < high < 1):
-            raise ValueError(f"PHASE1_BANDS entry {chunk!r} needs 0 < low < high < 1")
-        if interval is not None and not (
-                math.isfinite(interval) and 1 <= interval <= (start - end)):
-            raise ValueError(
-                f"PHASE1_BANDS entry {chunk!r} needs a cadence of 1..{start - end}s")
-        bands.append((start, end, low, high, interval))
-    if not bands:
-        raise ValueError("PHASE1_BANDS must list at least one window")
-    bands.sort(key=lambda b: -b[0])
-    for earlier, later in zip(bands, bands[1:]):
-        if later[0] > earlier[1]:
-            raise ValueError(
-                f"PHASE1_BANDS windows overlap: {earlier[0]}:{earlier[1]} "
-                f"and {later[0]}:{later[1]}")
-    return tuple(bands)
-
-
-PHASE1_BANDS = _parse_bands(PHASE1_BANDS_RAW)
-PHASE1_START_SECONDS = PHASE1_BANDS[0][0]
-PHASE1_END_SECONDS = PHASE1_BANDS[-1][1]
-# Kept for callers that want the overall reach of phase 1 rather than a
-# specific window's band.
-PHASE1_MIN_PRICE = min(b[2] for b in PHASE1_BANDS)
-PHASE1_MAX_PRICE = max(b[3] for b in PHASE1_BANDS)
-
-
-def phase1_band(seconds_left: float):
-    """The band governing this instant, or None outside every window.
-
-    Returns (start, end, low, high, interval) with the cadence resolved, so
-    callers never have to know whether a band set its own.
-    """
-    for start, end, low, high, interval in PHASE1_BANDS:
-        if end < seconds_left <= start:
-            return start, end, low, high, (
-                PHASE1_INTERVAL_SECONDS if interval is None else interval)
-    return None
-
+# Last-minute loss trim. Off by default. When on, at most two extra FOKs of
+# the 0.80-0.88 favorite are allowed between T-START and T-CUTOFF, and only
+# when that path is still a hole while the other path is already green.
+# START is independent of MIN_SECONDS_TO_EXPIRY so a 0 last-minute floor
+# still loads, and so enabling trim does not reopen T-20..T-0.
+LATE_TRIM_ENABLED = bool(_env_bool("LATE_TRIM_ENABLED", False))
+LATE_TRIM_START_SECONDS = _env_float("LATE_TRIM_START_SECONDS", "60.0")
+LATE_TRIM_CUTOFF_SECONDS = _env_float("LATE_TRIM_CUTOFF_SECONDS", "20.0")
+LATE_TRIM_ASK_MIN = _env_float("LATE_TRIM_ASK_MIN", "0.80")
+LATE_TRIM_ASK_MAX = _env_float("LATE_TRIM_ASK_MAX", "0.88")
+LATE_TRIM_MAX_CLIPS = _env_int("LATE_TRIM_MAX_CLIPS", "2") or 2
+LATE_TRIM_CLIP_MULT = _env_float("LATE_TRIM_CLIP_MULT", "1")
+LATE_TRIM_INTERVAL_SECONDS = _env_float("LATE_TRIM_INTERVAL_SECONDS", "12.0")
 
 # Phase 2 keeps book and Chainlink votes as diagnostics, while fresh Binance
 # SIG PRICE is the sole order-side authority.  It remains off by default;
@@ -188,10 +121,18 @@ PHASE2_ENABLED = bool(_env_bool("PHASE2_ENABLED", False))
 # Off by default so existing paper runs preserve their one-leg-per-round risk
 # contract unless the experiment is selected explicitly.
 PAPER_ALLOW_SIGNAL_FLIPS = bool(_env_bool("PAPER_ALLOW_SIGNAL_FLIPS", False))
-if PAPER_ALLOW_SIGNAL_FLIPS and (PHASE1_ENABLED or not PHASE2_ENABLED):
-    raise ValueError(
-        "PAPER_ALLOW_SIGNAL_FLIPS requires PHASE1_ENABLED=0 and "
-        "PHASE2_ENABLED=1 so band and signal cadences cannot overlap")
+if PAPER_ALLOW_SIGNAL_FLIPS and not PHASE2_ENABLED:
+    raise ValueError("PAPER_ALLOW_SIGNAL_FLIPS requires PHASE2_ENABLED=1")
+
+# Permit the complement leg in LIVE after a verified signal reversal, the way
+# PAPER_ALLOW_SIGNAL_FLIPS does for paper. This is a risk decision, not a bug
+# fix: two independent venue orders are not an atomic pair, so a reversal can
+# leave the account holding one leg at a price the second leg never matched -
+# in PAPER that costs nothing, in LIVE it is real money on an unhedged side.
+# Off by default; enabling it is choosing that exposure knowingly.
+LIVE_ALLOW_SIGNAL_FLIPS = bool(_env_bool("LIVE_ALLOW_SIGNAL_FLIPS", False))
+if LIVE_ALLOW_SIGNAL_FLIPS and not PHASE2_ENABLED:
+    raise ValueError("LIVE_ALLOW_SIGNAL_FLIPS requires PHASE2_ENABLED=1")
 
 # Give SIG BOOK and SIG CHAINLINK their own orders instead of leaving them as
 # diagnostics. Each non-neutral signal trades its own side, so a round where
@@ -261,23 +202,32 @@ SKIP_JOINED_ROUND = bool(_env_bool("SKIP_JOINED_ROUND", False))
 
 PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 
+# Order side follows the DISSENTING signal when the three disagree, instead of
+# SIG PRICE unconditionally. Measured over 275 archived rounds this scored -5.83
+# per $100 against -1.90 for SIG PRICE alone, so it is off by default and is
+# selected deliberately. Requires PHASE2_MULTI_SIGNAL off: the minority rule
+# picks ONE side, and multi-signal exists to buy several.
+SIGNAL_MINORITY_RULE = bool(_env_bool("SIGNAL_MINORITY_RULE", False))
+
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")
+if SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL:
+    raise ValueError(
+        "SIGNAL_MINORITY_RULE selects a single dissenting side; it cannot be "
+        "combined with PHASE2_MULTI_SIGNAL, which buys one leg per signal")
 if PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS:
     raise ValueError(
         "PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS both relax the "
         "complement guard by different rules; enable exactly one")
+if PHASE2_MULTI_SIGNAL and LIVE_ALLOW_SIGNAL_FLIPS:
+    raise ValueError(
+        "PHASE2_MULTI_SIGNAL and LIVE_ALLOW_SIGNAL_FLIPS both relax the "
+        "complement guard by different rules; enable exactly one")
 
 # The order path refuses any submission outside the round's execution
-# interval. That interval has to reach back to the earliest second ANY enabled
-# phase can trade: sizing it from TRADE_LAST_SECONDS alone silently refuses
-# every phase-1 order as "outside the current round execution interval",
-# because phase 1 runs entirely before phase 2's window opens.
-EXECUTION_WINDOW_SECONDS = max(
-    TRADE_LAST_SECONDS,
-    PHASE1_START_SECONDS if PHASE1_ENABLED else 0,
-)
+# interval. With only phase 2 active, that is exactly TRADE_LAST_SECONDS.
+EXECUTION_WINDOW_SECONDS = TRADE_LAST_SECONDS
 
 
 # Polymarket takes shares * theta * p * (1-p) from a taker. For a fixed
@@ -342,31 +292,98 @@ def entry_cost_ceiling(cap_price: float) -> float:
 
 
 def _round_entry_budget() -> float:
-    """Worst-case CASH for one round, counting only the phases switched on.
+    """Worst-case CASH for one round.
 
-    Deriving it from the phases themselves means parking phase 2 lowers the
-    cap automatically, instead of leaving a ceiling sized for a path that no
-    longer runs. Each band is budgeted at its own ceiling price, so a band
-    priced above BET_SIZE/5 gets the room it will actually need.
+    Phase 2 stops at MIN_SECONDS_TO_EXPIRY, so its budget is the window it can
+    actually reach, not the whole tail of the round. Parking phase 2 leaves a
+    floor of one entry so MAX_ROUND_EXPOSURE >= BET_SIZE still holds.
     """
-    budget = 0.0
-    if PHASE1_ENABLED:
-        # Each band may set its own cadence, so budget them individually.
-        for start, end, _lo, hi, interval in PHASE1_BANDS:
-            gap = PHASE1_INTERVAL_SECONDS if interval is None else interval
-            entries = math.ceil((start - end) / max(gap, 1))
-            budget += entries * entry_cost_ceiling(hi)
-    if PHASE2_ENABLED:
-        # Phase 2 stops at MIN_SECONDS_TO_EXPIRY, so its budget is the window
-        # it can actually reach, not the whole tail of the round.
-        entries = math.ceil(
-            max(0.0, TRADE_LAST_SECONDS - MIN_SECONDS_TO_EXPIRY)
-            / max(TRADE_INTERVAL_SECONDS, 1))
-        budget += entries * entry_cost_ceiling(MAX_BUY_PRICE)
+    if not PHASE2_ENABLED:
+        return entry_cost_ceiling(MAX_BUY_PRICE)
+    entries = math.ceil(
+        max(0.0, TRADE_LAST_SECONDS - MIN_SECONDS_TO_EXPIRY)
+        / max(TRADE_INTERVAL_SECONDS, 1))
+    budget = entries * entry_cost_ceiling(MAX_BUY_PRICE)
     return budget if budget > 0 else entry_cost_ceiling(MAX_BUY_PRICE)
 
 
 MAX_ROUND_EXPOSURE = _env_float("MAX_ROUND_EXPOSURE", str(_round_entry_budget()))
+
+# ---- stop loss --------------------------------------------------------------
+# Sell a held leg once its BID reaches STOP_LOSS_PRICE. This is a client-side
+# trigger, not an order type: the CLOB has only FAK/FOK/GTC/GTD, so nothing
+# resting on the book can act as a stop. A resting sell fills when price RISES,
+# which is a take-profit; a stop has to be watched and then crossed.
+#
+# Measured over 275 archived rounds: 14.1% of legs that eventually WON traded
+# at or below 0.25 first, dipping as low as 0.04 with 143s still to run. A stop
+# therefore cuts roughly one winner in seven. On both-leg rounds the exit was
+# worth +$392 (t=+3.44) because it was selling a structurally dead second leg;
+# on single-leg rounds the same test came out at -0.58. Whether it pays depends
+# entirely on the haircut actually paid on the way out, which no archived run
+# recorded, so this ships OFF and instrumented.
+STOP_LOSS_ENABLED = bool(_env_bool("STOP_LOSS_ENABLED", False))
+STOP_LOSS_PRICE = _env_float("STOP_LOSS_PRICE", "0.25")
+# The absolute worst price the exit may accept while walking the book down.
+# Setting this to the trigger price makes the stop a pure limit that simply
+# does not fill in a thin book; lowering it buys certainty of exit with price.
+# At a haircut beyond 0.19 the measured benefit inverts, so a floor far below
+# the trigger is choosing execution over expectancy - deliberately.
+STOP_LOSS_FLOOR_PRICE = _env_float("STOP_LOSS_FLOOR_PRICE", "0.05")
+# Do not arm before this many seconds remain. The winners that recovered from
+# under 0.25 did so at 93-209s left; a stop armed round-wide cut 13 of them
+# against 5 when it only armed inside 120s.
+STOP_LOSS_ARM_SECONDS = _env_float("STOP_LOSS_ARM_SECONDS", "120")
+# Stop placing exits this close to expiry. The trader studied here stopped
+# trading entirely at T-30 and placed nothing in the final 30 seconds.
+STOP_LOSS_EXIT_CUTOFF_SECONDS = _env_float("STOP_LOSS_EXIT_CUTOFF_SECONDS", "20")
+STOP_LOSS_POLL_SECONDS = _env_float("STOP_LOSS_POLL_SECONDS", "1.0")
+if not 0.0 < STOP_LOSS_PRICE < 1.0:
+    raise ValueError("STOP_LOSS_PRICE must be strictly between 0 and 1")
+if not 0.0 < STOP_LOSS_FLOOR_PRICE <= STOP_LOSS_PRICE:
+    raise ValueError(
+        "STOP_LOSS_FLOOR_PRICE must be in (0, STOP_LOSS_PRICE]: a floor above "
+        "the trigger could never fill")
+if not 0.0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300.0:
+    raise ValueError(
+        "need 0 <= STOP_LOSS_EXIT_CUTOFF_SECONDS < STOP_LOSS_ARM_SECONDS <= 300")
+if not 0.2 <= STOP_LOSS_POLL_SECONDS <= 30.0:
+    raise ValueError("STOP_LOSS_POLL_SECONDS must be between 0.2 and 30")
+
+# ---- take profit ------------------------------------------------------------
+# Mirror of the stop loss on the other side: whichever leg's BID reaches
+# TAKE_PROFIT_PRICE first is sold. A round settling to $1.00 pays every share
+# in full, so selling at 0.98 locks that outcome minus ~2c of headroom for
+# late-round reversal risk. Runs on its own task at the same cadence and reuses
+# the same _LiveExitBroker as the stop loss - the FAK exit contract is
+# identical, only the direction of the trigger inverts.
+#
+# min_price on the exit equals TAKE_PROFIT_PRICE. This is deliberate: a fill
+# below 0.98 defeats the reason for the trigger, so the order silently fills
+# nothing if the book moves down between the check and the FAK. Widen with
+# TAKE_PROFIT_FLOOR_PRICE only when you want to accept slippage explicitly.
+TAKE_PROFIT_ENABLED = bool(_env_bool("TAKE_PROFIT_ENABLED", False))
+TAKE_PROFIT_PRICE = _env_float("TAKE_PROFIT_PRICE", "0.98")
+TAKE_PROFIT_FLOOR_PRICE = _env_float("TAKE_PROFIT_FLOOR_PRICE",
+                                     str(TAKE_PROFIT_PRICE))
+TAKE_PROFIT_POLL_SECONDS = _env_float("TAKE_PROFIT_POLL_SECONDS", "1.0")
+if not 0.0 < TAKE_PROFIT_PRICE < 1.0:
+    raise ValueError("TAKE_PROFIT_PRICE must be strictly between 0 and 1")
+if not 0.0 < TAKE_PROFIT_FLOOR_PRICE <= TAKE_PROFIT_PRICE:
+    raise ValueError(
+        "TAKE_PROFIT_FLOOR_PRICE must be in (0, TAKE_PROFIT_PRICE]: a floor "
+        "above the trigger could never fill")
+if not 0.2 <= TAKE_PROFIT_POLL_SECONDS <= 30.0:
+    raise ValueError("TAKE_PROFIT_POLL_SECONDS must be between 0.2 and 30")
+# Stops sell into the losing side (bid falling); TP sells into the winning
+# side (bid rising). They cannot both fire on the same leg meaningfully - a
+# leg's bid can't simultaneously be below STOP_LOSS_PRICE and above
+# TAKE_PROFIT_PRICE - so the guard here is only that the operator did not
+# accidentally invert the two.
+if (STOP_LOSS_ENABLED and TAKE_PROFIT_ENABLED
+        and STOP_LOSS_PRICE >= TAKE_PROFIT_PRICE):
+    raise ValueError(
+        "STOP_LOSS_PRICE must stay below TAKE_PROFIT_PRICE when both are on")
 
 CANCEL_OPEN_BEFORE_TRADE = bool(_env_bool("CANCEL_OPEN_BEFORE_TRADE", False))
 ALLOW_GLOBAL_CANCEL_ALL = bool(_env_bool("ALLOW_GLOBAL_CANCEL_ALL", False))
@@ -404,32 +421,6 @@ if not math.isfinite(MIN_BUY_PRICE) or not 0 < MIN_BUY_PRICE < 1:
     raise ValueError("MIN_BUY_PRICE must be strictly between 0 and 1")
 if not MIN_BUY_PRICE < MAX_BUY_PRICE:
     raise ValueError("MIN_BUY_PRICE must be below MAX_BUY_PRICE")
-# Window and band shapes are validated in _parse_bands; what is left is the
-# cadence fitting the tightest window, and the stake clearing the venue
-# minimum at the most expensive price any band can reach.
-# Bands carrying their own cadence are validated in _parse_bands; the default
-# only has to fit the narrowest window that relies on it.
-_default_users = [b for b in PHASE1_BANDS if b[4] is None]
-_narrowest = min((start - end for start, end, _l, _h, _i in _default_users),
-                 default=300)
-if (not math.isfinite(PHASE1_INTERVAL_SECONDS)
-        or not 1 <= PHASE1_INTERVAL_SECONDS <= _narrowest):
-    raise ValueError(
-        f"PHASE1_INTERVAL_SECONDS must fit the narrowest band window ({_narrowest}s)")
-# The venue minimum is 5 shares, so a band whose prices exceed BET_SIZE/5
-# forces the engine to size the order up. That is legitimate - it is what the
-# venue requires - but it must never be silent, because the stake then varies
-# with price and a per-$100 comparison across bands stops being like-for-like.
-PHASE1_STAKE_NOTES = tuple(
-    (start, end, low, high, round(5 * low, 2), round(5 * high, 2))
-    for start, end, low, high, _i in PHASE1_BANDS
-    if 5 * high > BET_SIZE + 1e-9
-)
-if PHASE1_ENABLED and BET_SIZE < 5 * PHASE1_MIN_PRICE - 1e-9:
-    raise ValueError(
-        f"BET_SIZE {BET_SIZE} cannot buy the 5-share venue minimum anywhere in "
-        f"the cheapest band ({PHASE1_MIN_PRICE}); raise it to "
-        f"{5 * PHASE1_MIN_PRICE:.2f}")
 _finite_positive("BTC_STALE_AFTER", BTC_STALE_AFTER)
 _finite_positive("ORDERBOOK_MAX_AGE_SECONDS", ORDERBOOK_MAX_AGE_SECONDS)
 _finite_positive("ORDERBOOK_MAX_QUIET_SECONDS", ORDERBOOK_MAX_QUIET_SECONDS)
@@ -449,6 +440,33 @@ _finite_positive("TWAP_STALE_AFTER", TWAP_STALE_AFTER)
 if (not math.isfinite(MIN_SECONDS_TO_EXPIRY)
         or not 0 <= MIN_SECONDS_TO_EXPIRY < TRADE_LAST_SECONDS):
     raise ValueError("MIN_SECONDS_TO_EXPIRY must be non-negative and below TRADE_LAST_SECONDS")
+if LATE_TRIM_MAX_CLIPS not in (1, 2):
+    raise ValueError("LATE_TRIM_MAX_CLIPS must be 1 or 2")
+if not math.isfinite(LATE_TRIM_CLIP_MULT) or not 1.0 <= LATE_TRIM_CLIP_MULT <= 2.0:
+    raise ValueError("LATE_TRIM_CLIP_MULT must be in [1, 2]")
+if (not math.isfinite(LATE_TRIM_INTERVAL_SECONDS)
+        or not 5.0 <= LATE_TRIM_INTERVAL_SECONDS <= 30.0):
+    raise ValueError("LATE_TRIM_INTERVAL_SECONDS must be between 5 and 30")
+if (not math.isfinite(LATE_TRIM_CUTOFF_SECONDS)
+        or not math.isfinite(LATE_TRIM_START_SECONDS)
+        or not 0.0 <= LATE_TRIM_CUTOFF_SECONDS < LATE_TRIM_START_SECONDS
+        or not LATE_TRIM_START_SECONDS < TRADE_LAST_SECONDS):
+    raise ValueError(
+        "LATE_TRIM_CUTOFF_SECONDS must be in [0, LATE_TRIM_START_SECONDS) "
+        "and LATE_TRIM_START_SECONDS must be below TRADE_LAST_SECONDS")
+if (not math.isfinite(LATE_TRIM_ASK_MIN) or not math.isfinite(LATE_TRIM_ASK_MAX)
+        or not 0.0 < LATE_TRIM_ASK_MIN < LATE_TRIM_ASK_MAX < 1.0):
+    raise ValueError("LATE_TRIM_ASK_MIN must be below LATE_TRIM_ASK_MAX in (0, 1)")
+# The 0.80-0.88 band is the product default. Operators may run a tighter
+# MAX_BUY_PRICE while trim is off; only fail when the flag would actually
+# submit an order the account ceiling cannot cover.
+if LATE_TRIM_ENABLED:
+    if LATE_TRIM_ASK_MAX - 1e-12 > MAX_BUY_PRICE:
+        raise ValueError(
+            "LATE_TRIM_ASK_MAX cannot exceed MAX_BUY_PRICE; raise MAX_BUY_PRICE "
+            "or lower LATE_TRIM_ASK_MAX before enabling late trim")
+    if LATE_TRIM_ASK_MIN + 1e-12 < MIN_BUY_PRICE:
+        raise ValueError("LATE_TRIM_ASK_MIN cannot be below MIN_BUY_PRICE")
 if not math.isfinite(MAX_ROUND_EXPOSURE) or MAX_ROUND_EXPOSURE < BET_SIZE:
     raise ValueError("MAX_ROUND_EXPOSURE must be finite and at least BET_SIZE")
 if POLY_SIGNATURE_TYPE not in (None, 0, 1, 2, 3):

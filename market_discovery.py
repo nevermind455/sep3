@@ -21,7 +21,7 @@ EXPECTED_TWAP_LOOKBACK_SECONDS = 60
 
 
 def _current_5m_window_start_unix(now: float | None = None):
-    current = int(timer.wall() if now is None else now)
+    current = int(timer.unix() if now is None else now)
     return current - current % WINDOW_SECONDS
 
 

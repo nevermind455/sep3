@@ -494,7 +494,12 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         paper_paths = _paper_state_paths()
         ledger = Ledger(
             path=str(paper_paths["ledger"]),
-            category=os.environ.get("MARKET_CATEGORY", "crypto"))
+            category=os.environ.get("MARKET_CATEGORY", "crypto"),
+            # Exits stay refused unless a stop or take-profit is actually
+            # running, so the buy-and-hold contract is unchanged for every
+            # existing config.
+            allow_sells=(config.STOP_LOSS_ENABLED
+                         or config.TAKE_PROFIT_ENABLED))
         starting = (paper_balance if paper_balance is not None else
                     float(os.environ.get("PAPER_START_BALANCE", "1000")))
         broker = PaperBroker(
@@ -534,11 +539,19 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         # Left unset for LIVE, which keeps the pair-lock closed there.
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
+        main_bot._round_inventory_provider = (
+            lambda condition: ledger.open_inventory_for_condition(condition))
     else:
         import polymarket_trade
+        # Live exits arrive on the private fill stream like any other fill.
+        # Without this the ledger refuses them as skipped_side, and the book
+        # keeps showing a position that has already been sold - a silent
+        # divergence between accounting and the chain.
         ledger = Ledger(path=str(_state_path("LEDGER_PATH", "ledger.json")),
                         category=os.environ.get("MARKET_CATEGORY", "crypto"),
-                        fee_resolver=polymarket_trade.market_fee_parameters)
+                        fee_resolver=polymarket_trade.market_fee_parameters,
+                        allow_sells=(config.STOP_LOSS_ENABLED
+                                     or config.TAKE_PROFIT_ENABLED))
 
         def journal_live_order(receipt: dict) -> bool:
             order_id = receipt.get("order_id")
@@ -567,6 +580,8 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
         main_bot._execution_ready_provider = hub.user.ready_for_market
+        main_bot._round_inventory_provider = (
+            lambda condition: ledger.open_inventory_for_condition(condition))
 
     # Prove the accounting directory is writable before any feed or order task
     # starts. A bot that cannot durably journal fills is not safe to run.
@@ -631,6 +646,20 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     tasks.append(asyncio.create_task(
         adapters.price_staleness_watchdog(hub, cfg, stop, on_event)))
     tasks.append(asyncio.create_task(_rotation_loop(hub, stop), name="rotation"))
+    # A single exit broker serves BOTH stop-loss and take-profit. LIVE has no
+    # PaperBroker, so build one adapter here and pass it to whichever exit
+    # tasks are enabled; live must never silently skip an exit loop.
+    exit_broker = None
+    if config.STOP_LOSS_ENABLED or config.TAKE_PROFIT_ENABLED:
+        exit_broker = broker if broker is not None else _LiveExitBroker()
+    if config.STOP_LOSS_ENABLED:
+        tasks.append(asyncio.create_task(
+            _stop_loss_loop(hub, exit_broker, ledger, stop, on_event),
+            name="stoploss"))
+    if config.TAKE_PROFIT_ENABLED:
+        tasks.append(asyncio.create_task(
+            _take_profit_loop(hub, exit_broker, ledger, stop, on_event),
+            name="takeprofit"))
     tasks.append(asyncio.create_task(
         adapters.agreement_sampler(hub, cfg, agreement, stop, on_event), name="audit"))
     tasks.append(strike.start())
@@ -768,6 +797,237 @@ async def _ledger_loop(hub, ledger, stop) -> None:
             on_event("ledger", f"{type(exc).__name__}: {exc}", "warn")
 
 
+class _LiveExitBroker:
+    """Adapts the live CLOB to the exit interface the stop loop expects.
+
+    The shapes differ in one way that matters: a PAPER exit books its own fill
+    synchronously, while a LIVE exit only *submits* and the fill arrives later
+    on the private stream. So this returns shares SUBMITTED, and the caller
+    must not treat a return value as a settled position change.
+    """
+
+    mode = "LIVE"
+
+    def __init__(self) -> None:
+        import polymarket_trade
+        self._pt = polymarket_trade
+        self.last_error = None
+
+    def sell_shares(self, token_id, shares, *, min_price=0.0,
+                    condition_id=None, window_end=None,
+                    exit_cutoff_seconds=0.0) -> float:
+        import timer as _timer
+        if window_end is not None:
+            cutoff = float(window_end) - float(exit_cutoff_seconds)
+            if _timer.unix() >= cutoff:
+                self.last_error = "exit cutoff reached"
+                return 0.0
+        submitted = self._pt.sell_shares(
+            str(token_id), float(shares), min_price=float(min_price),
+            condition_id=condition_id, window_end=window_end)
+        self.last_error = self._pt.last_order_error
+        return float(submitted or 0.0)
+
+
+# Exit-loop back-off: after this many consecutive sell failures on the same
+# (window, token) the loop stops retrying for `_EXIT_BACKOFF_SECONDS`. The
+# venue almost never fixes a repeated rejection on the next poll - what usually
+# fixes it is round rotation, and the round already rotates on its own schedule.
+# Hammering CLOB at 1 Hz for a full round has been shown to burn API budget
+# and can get the wallet's keys flagged; a per-token cool-down keeps a broken
+# sell from becoming a broken account.
+_EXIT_MAX_FAILS_BEFORE_BACKOFF = 3
+_EXIT_BACKOFF_SECONDS = 60.0
+
+
+async def _stop_loss_loop(hub, broker, ledger, stop, on_event) -> None:
+    """Watch held legs and exit any whose BID reaches the stop.
+
+    Deliberately its own task rather than a step inside the trading loop. The
+    entry path costs about four seconds per attempt - discovery, a clock check
+    and several book reads - and an exit needs none of that: the token is
+    already known. Sharing the entry pipeline would mean the stop could only
+    fire as often as the bot decides to buy, which is exactly backwards.
+    """
+    import config
+    import timer
+    fired: set[tuple[int, str]] = set()
+    # A LIVE exit only submits; its fill lands later on the private stream.
+    # Without a grace window the next poll still sees the full position and
+    # fires again, selling the same shares twice. PAPER books synchronously and
+    # is already flat by then, so the guard simply never triggers there.
+    inflight: dict[tuple[int, str], float] = {}
+    fail_streak: dict[tuple[int, str], int] = {}
+    backoff_until: dict[tuple[int, str], float] = {}
+    LIVE_FILL_GRACE_S = 10.0
+    while not stop.is_set():
+        try:
+            sampled = timer.unix()
+            window = timer.window_start(sampled)
+            remain = (window + 300) - sampled
+            armed = (config.STOP_LOSS_EXIT_CUTOFF_SECONDS < remain
+                     <= config.STOP_LOSS_ARM_SECONDS)
+            condition = hub.condition_id
+            if armed and condition:
+                held = []
+                with ledger._lock:
+                    for token, pos in ledger.positions.items():
+                        if (not pos.settled and pos.shares > 1e-9
+                                and pos.condition_id == condition):
+                            held.append((token, pos.shares))
+                now_mono = time.monotonic()
+                for token, shares in held:
+                    key = (window, token)
+                    if key in fired:
+                        continue
+                    if now_mono < inflight.get(key, 0.0):
+                        continue
+                    if now_mono < backoff_until.get(key, 0.0):
+                        continue
+                    view = hub.book.view(str(token))
+                    bid = getattr(view, "best_bid", None) if view else None
+                    if bid is None or float(bid) > config.STOP_LOSS_PRICE:
+                        continue
+                    on_event("stoploss",
+                             f"bid {float(bid):.3f} <= {config.STOP_LOSS_PRICE:.3f} "
+                             f"with {remain:.0f}s left; exiting {shares:.4f} sh",
+                             "warn")
+                    sold = await asyncio.to_thread(
+                        broker.sell_shares, str(token), float(shares),
+                        min_price=config.STOP_LOSS_FLOOR_PRICE,
+                        condition_id=condition,
+                        window_end=window + 300,
+                        exit_cutoff_seconds=config.STOP_LOSS_EXIT_CUTOFF_SECONDS)
+                    if sold > 0:
+                        inflight[key] = time.monotonic() + LIVE_FILL_GRACE_S
+                        fail_streak.pop(key, None)
+                        backoff_until.pop(key, None)
+                        on_event("stoploss", f"exited {sold:.4f} sh", "good")
+                        # Only stop watching once the leg is actually flat. A
+                        # partial fill leaves real exposure, and marking it
+                        # done here would abandon the remainder.
+                        with ledger._lock:
+                            left = ledger.positions.get(token)
+                            if left is None or left.shares <= 1e-9:
+                                fired.add(key)
+                    else:
+                        streak = fail_streak.get(key, 0) + 1
+                        fail_streak[key] = streak
+                        on_event("stoploss",
+                                 f"exit did not fill ({streak}x): {broker.last_error}",
+                                 "warn")
+                        if streak >= _EXIT_MAX_FAILS_BEFORE_BACKOFF:
+                            backoff_until[key] = time.monotonic() + _EXIT_BACKOFF_SECONDS
+                            on_event("stoploss",
+                                     f"backing off {_EXIT_BACKOFF_SECONDS:.0f}s "
+                                     f"after {streak} consecutive failures", "bad")
+            elif not armed:
+                fired = {k for k in fired if k[0] == window}
+                inflight = {k: v for k, v in inflight.items() if k[0] == window}
+                fail_streak = {k: v for k, v in fail_streak.items() if k[0] == window}
+                backoff_until = {k: v for k, v in backoff_until.items() if k[0] == window}
+        except Exception as exc:
+            on_event("stoploss", f"{type(exc).__name__}: {exc}", "warn")
+        await asyncio.sleep(config.STOP_LOSS_POLL_SECONDS)
+
+
+async def _take_profit_loop(hub, broker, ledger, stop, on_event) -> None:
+    """Watch held legs and exit any whose BID reaches TAKE_PROFIT_PRICE.
+
+    Mirror of _stop_loss_loop with three deliberate differences:
+
+    1. No arm/cutoff window. A leg trading at 0.98 the moment it's held is
+       already at take-profit — waiting for the last minute would just donate
+       spread to whoever gets there first. If the operator wants a windowed
+       take-profit, this loop is the wrong place; a windowed one would need
+       its own config.
+    2. Trigger direction is BID >= threshold, not BID <=. Same "whichever
+       side gets there first" semantics as the stop, just on the winning
+       tail.
+    3. The exit's min_price defaults to TAKE_PROFIT_PRICE itself (no walking
+       down), because a fill below 0.98 defeats the whole reason for the
+       trigger. TAKE_PROFIT_FLOOR_PRICE overrides that only when the
+       operator wants to accept slippage.
+    """
+    import config
+    import timer
+    fired: set[tuple[int, str]] = set()
+    inflight: dict[tuple[int, str], float] = {}
+    fail_streak: dict[tuple[int, str], int] = {}
+    backoff_until: dict[tuple[int, str], float] = {}
+    LIVE_FILL_GRACE_S = 10.0
+    while not stop.is_set():
+        try:
+            sampled = timer.unix()
+            window = timer.window_start(sampled)
+            condition = hub.condition_id
+            if condition:
+                held = []
+                with ledger._lock:
+                    for token, pos in ledger.positions.items():
+                        if (not pos.settled and pos.shares > 1e-9
+                                and pos.condition_id == condition):
+                            held.append((token, pos.shares))
+                now_mono = time.monotonic()
+                for token, shares in held:
+                    key = (window, token)
+                    if key in fired:
+                        continue
+                    if now_mono < inflight.get(key, 0.0):
+                        continue
+                    if now_mono < backoff_until.get(key, 0.0):
+                        continue
+                    view = hub.book.view(str(token))
+                    bid = getattr(view, "best_bid", None) if view else None
+                    if bid is None or float(bid) < config.TAKE_PROFIT_PRICE:
+                        continue
+                    on_event("takeprofit",
+                             f"bid {float(bid):.3f} >= "
+                             f"{config.TAKE_PROFIT_PRICE:.3f}; "
+                             f"exiting {shares:.4f} sh",
+                             "good")
+                    sold = await asyncio.to_thread(
+                        broker.sell_shares, str(token), float(shares),
+                        min_price=config.TAKE_PROFIT_FLOOR_PRICE,
+                        condition_id=condition,
+                        window_end=window + 300,
+                        # TP has no cutoff of its own; pass 0 so the exit only
+                        # refuses once the round has actually ended.
+                        exit_cutoff_seconds=0.0)
+                    if sold > 0:
+                        inflight[key] = time.monotonic() + LIVE_FILL_GRACE_S
+                        fail_streak.pop(key, None)
+                        backoff_until.pop(key, None)
+                        on_event("takeprofit", f"exited {sold:.4f} sh @ "
+                                 f">=${config.TAKE_PROFIT_PRICE:.2f}", "good")
+                        with ledger._lock:
+                            left = ledger.positions.get(token)
+                            if left is None or left.shares <= 1e-9:
+                                fired.add(key)
+                    else:
+                        streak = fail_streak.get(key, 0) + 1
+                        fail_streak[key] = streak
+                        on_event("takeprofit",
+                                 f"exit did not fill ({streak}x): "
+                                 f"{broker.last_error}", "warn")
+                        if streak >= _EXIT_MAX_FAILS_BEFORE_BACKOFF:
+                            backoff_until[key] = time.monotonic() + _EXIT_BACKOFF_SECONDS
+                            on_event("takeprofit",
+                                     f"backing off {_EXIT_BACKOFF_SECONDS:.0f}s "
+                                     f"after {streak} consecutive failures", "bad")
+            # A round rollover invalidates the per-round bookkeeping. Prune
+            # entries for prior windows so a very long-running process cannot
+            # accumulate them, and so a token that reappears in a later round
+            # is not silently blocked by a stale fired-set entry.
+            fired = {k for k in fired if k[0] == window}
+            inflight = {k: v for k, v in inflight.items() if k[0] == window}
+            fail_streak = {k: v for k, v in fail_streak.items() if k[0] == window}
+            backoff_until = {k: v for k, v in backoff_until.items() if k[0] == window}
+        except Exception as exc:
+            on_event("takeprofit", f"{type(exc).__name__}: {exc}", "warn")
+        await asyncio.sleep(config.TAKE_PROFIT_POLL_SECONDS)
+
+
 async def _rotation_loop(hub, stop) -> None:
     """Discover this round's tokens EARLY.
 
@@ -783,12 +1043,17 @@ async def _rotation_loop(hub, stop) -> None:
     import market_discovery
     import config
     import timer
+    # Prewarming is an optimisation; rotating on time is not. A discovery call
+    # can block for ~21s (10s timeout, two attempts, plus the retry pause), so
+    # starting one inside this many seconds of the boundary risks landing on
+    # top of the rotation it exists to precede.
+    PREPARE_FLOOR_SECONDS = 25.0
     last_key = None
     cleared_key = None
     prepared_key = None
     while not stop.is_set():
         try:
-            sampled = timer.wall()
+            sampled = timer.unix()
             remain = timer.seconds_left(sampled)
             window = timer.window_start(sampled)
             key = window
@@ -812,10 +1077,21 @@ async def _rotation_loop(hub, stop) -> None:
                                             tokens.get("window_start"),
                                             tokens.get("window_end"))
                     if changed:
+                        # `remain` predates the discovery call above, which can
+                        # block for seconds. Report the clock as it is now, or
+                        # the line understates how late the rotation landed.
                         on_event("rotation",
-                                 f"round tokens subscribed with {remain}s left", "info")
+                                 f"round tokens subscribed with "
+                                 f"{timer.seconds_left()}s left", "info")
                     last_key = key
-            if (remain <= config.ROUND_PREPARE_LEAD_SECONDS
+            # Re-read the clock: current-round discovery above may have
+            # blocked for seconds, and a stale `remain` was letting this branch
+            # start a ~21s call with the boundary already in reach. A failed
+            # attempt leaves prepared_key unset and would otherwise retry that
+            # call on every poll, straight through the rotation.
+            remain_now = timer.seconds_left()
+            if (PREPARE_FLOOR_SECONDS <= remain_now
+                    <= config.ROUND_PREPARE_LEAD_SECONDS
                     and prepared_key != window + 300):
                 next_window = window + 300
                 prepared = await asyncio.to_thread(
@@ -825,7 +1101,7 @@ async def _rotation_loop(hub, stop) -> None:
                     if hub.prepare_round(prepared):
                         on_event("rotation",
                                  f"next round books pre-subscribed with "
-                                 f"{remain:.0f}s left", "good")
+                                 f"{timer.seconds_left()}s left", "good")
                     prepared_key = next_window
         except Exception as exc:
             on_event("rotation", f"{type(exc).__name__}: {exc}", "warn")
@@ -833,8 +1109,20 @@ async def _rotation_loop(hub, stop) -> None:
         # so a rotation landing 6s late costs the whole round. Poll every second
         # across the boundary and back off in mid-round, where there is nothing
         # to win and gamma-api rate-limits.
-        near_boundary = remain <= 10.0 or remain >= 290.0
-        await asyncio.sleep(1.0 if near_boundary else config.ROUND_POLL_SECONDS)
+        #
+        # BUGFIX: `remain` is sampled at the TOP of the loop, before up to two
+        # discovery calls that each block for as long as ~21s. Choosing the
+        # cadence from that stale value meant a call spanning the boundary was
+        # followed by a further ROUND_POLL_SECONDS of sleep - so rotation woke
+        # ~10s INTO the new round, past the 5s window in which the opening
+        # print can be latched, and the round was unrecoverable. Re-sample the
+        # clock after the awaits, and never sleep past a boundary however long
+        # discovery took.
+        sampled_now = timer.unix()
+        to_boundary = (timer.window_start(sampled_now) + 300) - sampled_now
+        near_boundary = to_boundary <= 10.0 or to_boundary >= 290.0
+        delay = 1.0 if near_boundary else config.ROUND_POLL_SECONDS
+        await asyncio.sleep(max(0.1, min(delay, to_boundary + 0.05)))
 
 
 async def _health_log(hub, cfg, agreement, reconciler, stop, ledger=None,
@@ -924,14 +1212,22 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
         return
     state = TerminalState()
     real_stdout = probe.install(state)          # probes AFTER adapters, by design
+    try:
+        probe.attach_asyncio(asyncio.get_running_loop(), state)
+    except Exception as exc:
+        state.event("DASH", f"asyncio hook attach failed: {type(exc).__name__}: {exc}",
+                    "warn")
     renderer = make_renderer(real_stdout)
+    _latency_next_emit = 0.0
+    _LATENCY_EMIT_EVERY_S = 60.0
     g = glyphs()
     render_failed = False
+    import config
     import main_bot
     import timer
     with renderer:
         while not stop.is_set():
-            sampled_wall = timer.wall()
+            sampled_wall = timer.unix()
             round_window = timer.window_start(sampled_wall)
             state.set_round_context(
                 round_window,
@@ -974,8 +1270,56 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
 
             accounting = (broker.summary(mark=mark) if broker is not None else
                           (ledger.summary(mark=mark) if ledger is not None else {}))
+
+            # ---- what the stop loss is watching, and what it has sold -------
+            exits = []
+            held_legs = []
+            if ledger is not None:
+                label = {str(hub.up_token): "UP", str(hub.down_token): "DOWN"}
+                with ledger._lock:
+                    for token, pos in ledger.positions.items():
+                        for lot in (pos.lots or []):
+                            if str(lot.side or "").upper() != "SELL":
+                                continue
+                            exits.append({
+                                "time": time.strftime("%H:%M:%S",
+                                                      time.localtime(lot.wall)),
+                                "wall": lot.wall,
+                                "side": label.get(str(token), "--"),
+                                "shares": lot.shares,
+                                "price": lot.price,
+                                "proceeds": lot.shares * lot.price - lot.fee,
+                            })
+                        if (not pos.settled and pos.shares > 1e-9
+                                and pos.condition_id == hub.condition_id):
+                            view = hub.book.view(str(token))
+                            held_legs.append({
+                                "side": label.get(str(token), "--"),
+                                "shares": pos.shares,
+                                "bid": (view.best_bid if view
+                                        and view.status == "LIVE" else None),
+                            })
+                exits.sort(key=lambda e: e["wall"])
+            remain = None
+            if hub.window_end:
+                remain = float(hub.window_end) - timer.unix()
+            stop_status = {
+                "enabled": bool(config.STOP_LOSS_ENABLED),
+                "armed": bool(
+                    config.STOP_LOSS_ENABLED and remain is not None
+                    and config.STOP_LOSS_EXIT_CUTOFF_SECONDS < remain
+                    <= config.STOP_LOSS_ARM_SECONDS),
+                "trigger": config.STOP_LOSS_PRICE,
+                "floor": config.STOP_LOSS_FLOOR_PRICE,
+                "arm": config.STOP_LOSS_ARM_SECONDS,
+                "cutoff": config.STOP_LOSS_EXIT_CUTOFF_SECONDS,
+                "held": held_legs,
+            }
             with state.lock():
                 state.accounting = accounting
+                state.exits = exits[-40:]
+                state.stop_status = stop_status
+                state.late_trim = dict(getattr(main_bot, "_late_trim_status", None) or {})
                 if broker is not None:
                     state.balance.set({
                         "balance": accounting.get("cash", 0.0),
@@ -1015,6 +1359,28 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
                     with state.lock():
                         state.render_ms.append(renderer.last_ms)
                         state.frames += 1
+                    try:
+                        state.latency.observe("frame", renderer.last_ms)
+                    except Exception:
+                        pass
+                    now_mono = time.monotonic()
+                    if now_mono >= _latency_next_emit:
+                        _latency_next_emit = now_mono + _LATENCY_EMIT_EVERY_S
+                        try:
+                            snaps = state.latency.snapshot()
+                        except Exception:
+                            snaps = []
+                        parts: list[str] = []
+                        for h in snaps:
+                            if h.n <= 0 or h.p95 is None:
+                                continue
+                            parts.append(
+                                f"{h.stage} n={h.n} p50={h.p50:.0f} "
+                                f"p95={h.p95:.0f} p99={h.p99:.0f} "
+                                f"max={h.max:.0f}ms"
+                            )
+                        if parts:
+                            state.event("LAT", " | ".join(parts), "info")
                 except Exception as exc:
                     # A layout bug must not take the trading loop with it, and
                     # it must not stop at a frozen screen either: this task is
@@ -1049,16 +1415,34 @@ async def health_only() -> None:
 
 
 def _record_exit(reason: str, detail: str = "") -> None:
-    """Append why this process stopped, and never fail while doing it."""
+    """Append why this process stopped, and never fail while doing it.
+
+    While the dashboard has captured stderr, a raw stderr write would land on
+    top of the alt-screen frame. Route through captured stdout instead — the
+    probe funnels it to the event feed. Once the dashboard has uninstalled
+    (post-shutdown), stderr is safe to use again.
+    """
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     line = f"[{stamp}] pid={os.getpid()} {reason}\n"
     try:
         with (Path(__file__).parent / "bot_exit.log").open("a", encoding="utf-8") as fh:
             fh.write(line + (detail.rstrip() + "\n" if detail else ""))
     except OSError as exc:
+        try:
+            from dashboard import probe as _probe
+            dashboard_up = _probe.is_installed()
+        except Exception:
+            dashboard_up = False
+        target = sys.stdout if dashboard_up else sys.stderr
         print(f"[FEEDS] could not append bot_exit.log: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
-    print(f"[FEEDS] stopped - {reason}", file=sys.stderr)
+              file=target)
+    try:
+        from dashboard import probe as _probe
+        dashboard_up = _probe.is_installed()
+    except Exception:
+        dashboard_up = False
+    target = sys.stdout if dashboard_up else sys.stderr
+    print(f"[FEEDS] stopped - {reason}", file=target)
 
 
 if __name__ == "__main__":

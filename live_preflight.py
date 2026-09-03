@@ -52,7 +52,7 @@ def main() -> int:
         failures += 1
 
     # 3. market discovery --------------------------------------------------
-    window = timer.window_start(timer.wall())
+    window = timer.window_start(timer.unix())
     tokens = market_discovery.get_tokens_for_current_round(window)
     if not tokens:
         line(BAD, "market discovery", "no market for the current round")
@@ -67,7 +67,7 @@ def main() -> int:
                              timeout=10).json()
         itode = bool(info.get("itode"))
         assumed = float(config.ASSUMED_MATCH_DELAY_SECONDS)
-        remaining = timer.seconds_left(timer.wall())
+        remaining = timer.seconds_left(timer.unix())
         if not itode:
             line(OK, "matching delay", "venue reports no taker delay")
         elif assumed <= 0:

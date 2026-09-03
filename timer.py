@@ -29,12 +29,24 @@ def clock_measured() -> bool:
         return _clock_measured
 
 
+def unix(ts: float | None = None) -> float:
+    """Unshifted Unix time. Round identity and market slugs use this.
+
+    ``wall()`` follows CLOB ``/time`` and is only for exchange-timestamp age.
+    A lagging CLOB clock must not delay 5-minute windows: slugs are
+    ``btc-updown-5m-{unix}`` and Binance trade timestamps are Unix.
+    """
+    if ts is not None:
+        return float(ts)
+    return time.time()
+
+
 def wall(ts: float | None = None) -> float:
     """CLOB-aligned Unix time after a successful ``check_clock``.
 
     Explicit timestamps are returned unchanged so tests and recorded samples
-    stay literal.  Live call sites that need round identity should pass
-    ``timer.wall()``, not ``time.time()``.
+    stay literal. Round identity must use ``timer.unix()`` / ``window_start()``;
+    ``wall()`` is the clock to compare with CLOB-issued timestamps.
     """
     if ts is not None:
         return float(ts)
@@ -88,22 +100,22 @@ def exchange_age_s(ts_ms: int | float) -> float:
 
 
 def now_et(ts: float | None = None):
-    return datetime.fromtimestamp(wall() if ts is None else ts, ET)
+    return datetime.fromtimestamp(unix() if ts is None else ts, ET)
 
 
 def seconds_left(ts: float | None = None):
     """Whole seconds remaining, sampled from the same Unix instant as a round id.
 
     At an exact boundary this intentionally returns 300, never 0.  Callers can
-    pass one wall-clock sample to both this function and ``window_start`` so a
+    pass one Unix sample to both this function and ``window_start`` so a
     boundary cannot split their view across two different rounds.
     """
-    current = int(wall() if ts is None else ts)
+    current = int(unix() if ts is None else ts)
     return 300 - (current % 300)
 
 
 def window_start(ts: float | None = None, window: int = 300) -> int:
-    current = int(wall() if ts is None else ts)
+    current = int(unix() if ts is None else ts)
     return current - current % window
 
 

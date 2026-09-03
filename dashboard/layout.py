@@ -100,6 +100,9 @@ def snapshot(st: TerminalState, session_trades: list | None = None) -> dict[str,
             "candle_t": [c.t for c in st.candles],
             "events": copy.deepcopy(list(st.events)[-80:]),
             "trades": trades,
+            "exits": [copy.deepcopy(e) for e in list(st.exits)[-40:]],
+            "stop_status": copy.deepcopy(st.stop_status) if isinstance(st.stop_status, Mapping) else {},
+            "late_trim": copy.deepcopy(st.late_trim) if isinstance(st.late_trim, Mapping) else {},
             "absent": dict(st.absent),
             "overlay": copy.deepcopy(st.overlay),
             "loop_status": st.loop_beat.status_at(3.0, 12.0, now_mono),
@@ -110,6 +113,7 @@ def snapshot(st: TerminalState, session_trades: list | None = None) -> dict[str,
             "min_buy_price": _finite(st.min_buy_price),
             "render_ms": (_finite(sum(st.render_ms) / len(st.render_ms))
                           if st.render_ms else None),
+            "latency": st.latency.snapshot(),
             "frames": st.frames,
             "mode": terminal_text(st.mode, 16),
             "accounting": accounting,
@@ -123,6 +127,64 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _up_down_share(trades, field: str) -> str | None:
+    """Count this-round journal sides for one signal. Missing sides stay out."""
+    if not trades:
+        return None
+    up = sum(1 for t in trades if str(t.get(field) or "").upper() == "UP")
+    down = sum(1 for t in trades if str(t.get(field) or "").upper() == "DOWN")
+    if up + down == 0:
+        return None
+    return f"UP {up}  DOWN {down}"
+
+
+def _fmt_pnl(value: Any) -> str | None:
+    number = _finite(value)
+    return None if number is None else f"${number:+,.4f}"
+
+
+def _current_round_book(snap) -> Mapping | None:
+    """Open inventory for the displayed round; else the largest still-open book."""
+    books = [item for item in
+             list((snap.get("accounting") or {}).get("round_books") or [])
+             if isinstance(item, Mapping)]
+    if not books:
+        return None
+    cond = (snap.get("tokens") or {}).get("condition_id")
+    if cond:
+        for book in books:
+            if book.get("condition_id") == cond:
+                return book
+    return max(books, key=lambda item: abs(_finite(item.get("round_cost")) or 0.0))
+
+
+def _legs_by_side(book: Mapping | None, tokens: Mapping) -> tuple[Mapping | None, Mapping | None]:
+    if not book:
+        return None, None
+    up_id = str(tokens.get("up_token_id") or "")
+    down_id = str(tokens.get("down_token_id") or "")
+    up = down = None
+    for leg in list(book.get("legs") or []):
+        if not isinstance(leg, Mapping):
+            continue
+        tid = str(leg.get("token_id") or "")
+        if up_id and tid == up_id:
+            up = leg
+        elif down_id and tid == down_id:
+            down = leg
+    return up, down
+
+
+def _sh_cost(leg: Mapping | None) -> str | None:
+    if not leg:
+        return None
+    shares = _finite(leg.get("shares"))
+    cost = _finite(leg.get("cost"))
+    if shares is None or cost is None:
+        return None
+    return f"{shares:.5f} / ${cost:.5f}"
 
 
 # ------------------------------------------------------------------ sizing ---
@@ -346,29 +408,39 @@ def _round_panel(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     d = snap["decision"]
     body.append(kv("CURRENT SIDE", d or MISSING, w,
                    Style("green" if d == "UP" else "red", bold=True) if d else FAINT))
-    body.append(kv("MOMENTUM", MISSING, w, FAINT))
-    details = [item for item in
-               list((snap.get("accounting") or {}).get("open_position_details") or [])
-               if isinstance(item, Mapping)]
+    mom = snap["sig_price"]
+    binance_move = (spot - snap["start_price"]
+                    if spot is not None and snap["start_price"] is not None else None)
+    if mom and binance_move is not None:
+        mom_txt = f"{mom}  {binance_move:+,.2f}"
+    elif mom:
+        mom_txt = mom
+    else:
+        mom_txt = MISSING
+    body.append(kv("MOMENTUM", mom_txt, w,
+                   Style("green" if mom == "UP" else "red", bold=True) if mom else FAINT))
     tokens = snap.get("tokens") or {}
-    selected_token = (tokens.get("up_token_id") if d == "UP" else
-                      tokens.get("down_token_id") if d == "DOWN" else None)
-    position = next((p for p in details
-                     if str(p.get("token_id")) == str(selected_token)), None)
-    if position is None and details:
-        position = max(details, key=lambda p: _finite(p.get("latest_fill_wall")) or 0.0)
-    entry = _finite(position.get("average_entry_price")) if position else None
-    shares = _finite(position.get("shares")) if position else None
-    cost = _finite(position.get("cost")) if position else None
-    body.append(kv("ENTRY PRICE", f"{entry:.5f}" if entry is not None else MISSING,
-                   w, Style("ink") if position else FAINT))
-    body.append(kv("SHARES", f"{shares:.5f}" if shares is not None else MISSING,
-                   w, Style("ink") if position else FAINT))
-    body.append(kv("POSITION COST", f"${cost:.5f}" if cost is not None else MISSING,
-                   w, Style("ink") if position else FAINT))
-    body.append(kv("WIN PAYOUT", f"${shares:.5f}" if shares is not None else MISSING,
-                   w, Style("ink") if position else FAINT))
-    body.append(kv("EDGE / FAIR VALUE", MISSING, w, FAINT))
+    book = _current_round_book(snap)
+    up_leg, down_leg = _legs_by_side(book, tokens)
+    up_txt = _sh_cost(up_leg)
+    down_txt = _sh_cost(down_leg)
+    pair = _finite(book.get("pair_entry_with_fees") if book else None)
+    if pair is None:
+        pair = _finite(book.get("pair_entry") if book else None)
+    live = _finite(book.get("live_pnl") if book else None)
+    live_txt = _fmt_pnl(live)
+    pending = int((book or {}).get("unmarkable_legs") or 0)
+    body.append(kv("UP SHARES / COST", up_txt or MISSING, w,
+                   Style("ink") if up_txt else FAINT))
+    body.append(kv("DN SHARES / COST", down_txt or MISSING, w,
+                   Style("ink") if down_txt else FAINT))
+    body.append(kv("PAIR PRICE",
+                   f"{pair:.5f}" if pair is not None else MISSING, w,
+                   Style("ink") if pair is not None else FAINT))
+    body.append(kv("ROUND LIVE PNL",
+                   live_txt if live_txt is not None else
+                   (f"{MISSING} {pending} unmarkable" if pending else MISSING),
+                   w, pnl_style(live) if live_txt is not None else FAINT))
     body.append(kv("ASK BAND (MIN-MAX)",
                    (f"{snap['min_buy_price']:.2f}-{snap['max_buy_price']:.2f}"
                     if snap.get("min_buy_price") is not None and snap["max_buy_price"]
@@ -414,7 +486,8 @@ def _status_strip(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]
         ("SIGNAL", "SIGNAL", agree, "OK" if named else "WAIT"),
         ("GATE", "ENTRY GATE", "ABSENT", "ABSENT"),
         ("SIDE", "SIDE", d or "--", "UP" if d == "UP" else ("DOWN" if d == "DOWN" else "WAIT")),
-        ("MOM", "MOMENTUM", "ABSENT", "ABSENT"),
+        ("MOM", "MOMENTUM", snap["sig_price"] or "--",
+         snap["sig_price"] or "WAIT"),
         ("EDGE", "EDGE", "ABSENT", "ABSENT"),
         ("PAIR", "PAIR COST", "ABSENT", "ABSENT"),
         ("RISK", "RISK", "ABSENT", "ABSENT"),
@@ -657,7 +730,9 @@ def _dist(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     body.append(kv("CHAINLINK UP SHARE",
                    f"{sum(1 for t in trades if t.get('chainlink_side') == 'UP')}/{len(trades)}"
                    if trades else MISSING, w, Style("amber") if trades else FAINT))
-    body.append(kv("MOMENTUM DIST", MISSING, w, FAINT))
+    mom_dist = _up_down_share(trades, "price_side")
+    body.append(kv("MOMENTUM DIST", mom_dist or MISSING, w,
+                   Style("ink") if mom_dist else FAINT))
     return panel("SIGNAL DISTRIBUTION", body, cols, rows, g, right_note="this round")
 
 
@@ -692,6 +767,123 @@ def _trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     return panel("RECENT TRADES", body, cols, rows, g,
                  right_note="this round | history: paper_orders.jsonl"
                  if snap["mode"] == "PAPER" else "this round | history: ledger")
+
+
+def _round_book(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
+    """Combined UP+DOWN inventory, live mark-to-bid PnL, and a compact stop line.
+
+    Replaces the old EXITS / STOP table: matched pairs lock $1.00 at
+    settlement, leftover shares stay directional, and equity is withheld
+    when a bid is missing rather than invented as flat.
+    """
+    w = cols - 2
+    tokens = snap.get("tokens") or {}
+    book = _current_round_book(snap)
+    up_leg, down_leg = _legs_by_side(book, tokens)
+    live = _finite(book.get("live_pnl") if book else None)
+    live_txt = _fmt_pnl(live)
+    pending = int((book or {}).get("unmarkable_legs") or 0)
+    pair = _finite(book.get("pair_entry_with_fees") if book else None)
+    if pair is None:
+        pair = _finite(book.get("pair_entry") if book else None)
+    pair_mark = _finite(book.get("pair_mark") if book else None)
+    matched = _finite(book.get("matched_shares") if book else None)
+    locked = _finite(book.get("locked_pnl") if book else None)
+    leftover = _finite(book.get("leftover_shares") if book else None)
+    leftover_pnl = _fmt_pnl(book.get("leftover_pnl") if book else None)
+    leftover_id = str((book or {}).get("leftover_token_id") or "")
+    leftover_side = ("UP" if leftover_id and leftover_id == str(tokens.get("up_token_id") or "")
+                     else "DOWN" if leftover_id and leftover_id == str(tokens.get("down_token_id") or "")
+                     else None)
+
+    up_sh = _finite(up_leg.get("shares") if up_leg else None) or 0.0
+    down_sh = _finite(down_leg.get("shares") if down_leg else None) or 0.0
+    round_cost = _finite(book.get("round_cost") if book else None)
+    labeled = up_leg is not None or down_leg is not None
+    if_up = (up_sh - round_cost) if book and round_cost is not None and labeled else None
+    if_dn = (down_sh - round_cost) if book and round_cost is not None and labeled else None
+
+    body: list[Row] = []
+    body.append(kv("LIVE PNL",
+                   live_txt if live_txt is not None else
+                   (f"{MISSING} {pending} unmarkable" if pending else MISSING),
+                   w, pnl_style(live) if live_txt is not None else FAINT))
+    body.append(kv(L("UP SH/COST", "UP SHARES / COST", s),
+                   _sh_cost(up_leg) or MISSING, w,
+                   Style("green", bold=True) if up_leg else FAINT))
+    body.append(kv(L("DN SH/COST", "DN SHARES / COST", s),
+                   _sh_cost(down_leg) or MISSING, w,
+                   Style("red", bold=True) if down_leg else FAINT))
+    if pair is not None and matched is not None and matched > 0:
+        lock_txt = _fmt_pnl(locked) or MISSING
+        mark_txt = f"{pair_mark:.3f}" if pair_mark is not None else MISSING
+        body.append(kv("PAIR",
+                       f"{matched:.2f}sh paid {pair:.3f} mark {mark_txt} lock {lock_txt}",
+                       w, pnl_style(locked)))
+    else:
+        body.append(kv("PAIR", MISSING, w, FAINT))
+    if leftover is not None and leftover > 1e-9:
+        body.append(kv("LEFT",
+                       f"{leftover:.2f} {leftover_side or 'sh'}  {leftover_pnl or MISSING}",
+                       w, pnl_style(_finite(book.get("leftover_pnl") if book else None))))
+    else:
+        body.append(kv("LEFT", MISSING, w, FAINT))
+    if_txt = None
+    if if_up is not None and if_dn is not None:
+        if_txt = f"{_fmt_pnl(if_up)} / {_fmt_pnl(if_dn)}"
+    body.append(kv("IF UP / IF DN", if_txt or MISSING, w,
+                   Style("ink") if if_txt else FAINT))
+    trim = snap.get("late_trim") or {}
+    hole = _finite(trim.get("hole"))
+    if hole is None and if_up is not None and if_dn is not None:
+        if if_up < 0 <= if_dn:
+            hole = -if_up
+        elif if_dn < 0 <= if_up:
+            hole = -if_dn
+    body.append(kv("HOLE",
+                   f"${hole:,.2f} if {trim.get('side') or 'fav'}"
+                   if hole is not None and hole > 0 else
+                   (MISSING if hole is None else "none"),
+                   w, Style("red", bold=True) if hole and hole > 0 else FAINT))
+    if not trim.get("enabled"):
+        trim_txt, tstyle = "off", FAINT
+    elif trim.get("action") == "buy":
+        trim_txt = (
+            f"{trim.get('clips', 0)}/{trim.get('max_clips', 2)} "
+            f"{trim.get('side') or '--'} "
+            f"${_finite(trim.get('amount')) or 0:.2f} "
+            f"@{(_finite(trim.get('ask')) or 0):.2f}"
+        )
+        tstyle = Style("amber", bold=True)
+    else:
+        trim_txt = str(trim.get("reason") or "idle")
+        tstyle = FAINT
+    body.append(kv("TRIM", trim_txt, w, tstyle))
+
+    stat = snap.get("stop_status") or {}
+    if not stat.get("enabled"):
+        body.append(kv("STOP", "off", w, FAINT))
+        note = "off"
+    else:
+        armed = bool(stat.get("armed"))
+        trig = _finite(stat.get("trigger"))
+        floor = _finite(stat.get("floor"))
+        stop_txt = "ARMED" if armed else "waiting"
+        if trig is not None:
+            stop_txt += f"  trig {trig:.2f}"
+        if floor is not None:
+            stop_txt += f"  floor {floor:.2f}"
+        body.append(kv("STOP", stop_txt, w,
+                       Style("green", bold=True) if armed else FAINT))
+        note = (f"T{int(_finite(stat.get('arm')) or 0)}-"
+                f"{int(_finite(stat.get('cutoff')) or 0)}")
+    cond = (snap.get("tokens") or {}).get("condition_id")
+    this_round = bool(book and cond and book.get("condition_id") == cond)
+    if book and not this_round and cond:
+        note = "prior round open"
+    elif this_round:
+        note = "this round" if note == "off" else note
+    return panel("ROUND BOOK / PNL", body, cols, rows, g, right_note=note)
 
 
 def _events(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
@@ -813,10 +1005,21 @@ def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
             w1, w2 = hsplit(cols, [0.5, 0.5], [30, 30])
             frame += join([_trades(snap, w1, s.bot, g, s), _events(snap, w2, s.bot, g, s)],
                           [w1, w2], s.bot)
-        else:
-            w1, w2, w3 = hsplit(cols, [0.26, 0.34, 0.40], [28, 30, 30])
+        elif cols >= 120:
+            w1, w2, w3, w4 = hsplit(cols, [0.20, 0.26, 0.26, 0.28],
+                                    [26, 28, 28, 28])
             frame += join([_dist(snap, w1, s.bot, g, s),
                            _trades(snap, w2, s.bot, g, s),
+                           _round_book(snap, w3, s.bot, g, s),
+                           _events(snap, w4, s.bot, g, s)],
+                          [w1, w2, w3, w4], s.bot)
+        else:
+            # Narrower than four columns: the round-book panel displaces the
+            # P&L histogram rather than the trade or event feeds. Combined
+            # inventory has to be visible while the round is still open.
+            w1, w2, w3 = hsplit(cols, [0.30, 0.30, 0.40], [28, 28, 30])
+            frame += join([_trades(snap, w1, s.bot, g, s),
+                           _round_book(snap, w2, s.bot, g, s),
                            _events(snap, w3, s.bot, g, s)], [w1, w2, w3], s.bot)
 
     frame.append(_footer(snap, cols, g, s))

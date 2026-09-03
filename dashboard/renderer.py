@@ -43,6 +43,12 @@ def render_row(row: Row) -> str:
 
 
 class Renderer:
+    # Only one Renderer may own the alt-screen terminal at a time. A second
+    # entry would emit its own cursor moves and clear the first renderer's
+    # bookkeeping — the "two Live instances" failure mode.
+    _owner_lock = threading.Lock()
+    _current_owner: "Renderer | None" = None
+
     def __init__(self, stream=None, min_cols: int = 40, min_rows: int = 10) -> None:
         self.stream = stream or sys.__stdout__
         self.min_cols, self.min_rows = min_cols, min_rows
@@ -93,6 +99,14 @@ class Renderer:
     def start(self) -> None:
         if not self.interactive:
             return
+        with Renderer._owner_lock:
+            existing = Renderer._current_owner
+            if existing is not None and existing is not self:
+                raise RuntimeError(
+                    "another dashboard Renderer already owns the terminal; "
+                    "only one live renderer may run per process"
+                )
+            Renderer._current_owner = self
         if not enable_windows_vt():
             self.last_error = "terminal VT mode unavailable"
         if hasattr(signal, "SIGWINCH"):
@@ -127,16 +141,21 @@ class Renderer:
             self._old_winch = None
 
     def stop(self) -> None:
-        if not self._active:
-            self._restore_signal_handler()
-            return
         try:
-            self.stream.write(RESET + WRAP_ON + CURSOR_ON + ALT_OFF)
-            self.stream.flush()
-        except Exception as exc:
-            self.last_error = f"terminal restore failed: {exception_summary(exc)}"
-        self._active = False
-        self._restore_signal_handler()
+            if not self._active:
+                self._restore_signal_handler()
+                return
+            try:
+                self.stream.write(RESET + WRAP_ON + CURSOR_ON + ALT_OFF)
+                self.stream.flush()
+            except Exception as exc:
+                self.last_error = f"terminal restore failed: {exception_summary(exc)}"
+            self._active = False
+            self._restore_signal_handler()
+        finally:
+            with Renderer._owner_lock:
+                if Renderer._current_owner is self:
+                    Renderer._current_owner = None
 
     def __enter__(self):
         self.start()

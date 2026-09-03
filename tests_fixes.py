@@ -230,20 +230,24 @@ def t_strike_memory_is_bounded():
     check("strike map stays bounded", len(s.strikes) <= 200, str(len(s.strikes)))
 
 
-def t_strike_default_window_uses_the_clob_aligned_clock():
+def t_strike_default_window_uses_unix_not_a_lagging_clob_clock():
     import timer
 
     original_wall = timer.wall
+    original_unix = timer.unix
     original_time = strike_mod.time.time
     try:
-        # Local time is still in the previous round while the measured CLOB
-        # clock has crossed the boundary.
+        # CLOB /time has already crossed the boundary; Unix has not.
+        # Round identity must stay on Unix or the displayed round overruns
+        # and the next market opens late.
         strike_mod.time.time = lambda: 1_786_320_299.8
+        timer.unix = lambda *_a, **_k: 1_786_320_299.8
         timer.wall = lambda *_a, **_k: 1_786_320_301.2
-        check("RTDS default window follows CLOB time",
-              window_start() == 1_786_320_300, str(window_start()))
+        check("RTDS default window follows Unix, not CLOB /time",
+              window_start() == 1_786_320_000, str(window_start()))
     finally:
         timer.wall = original_wall
+        timer.unix = original_unix
         strike_mod.time.time = original_time
 
 
@@ -460,11 +464,11 @@ def t_paper_startup_does_not_abort_on_measured_clock_drift():
     check("live mode still fail-closes on unverified clock",
           'if mode == "LIVE":' in source
           and "CLOB clock synchronization could not be verified" in source)
-    check("paper mode continues on CLOB-corrected time",
+    check("paper mode keeps Unix round windows when CLOB drift is large",
           "PAPER continues" in source
-          and "CLOB-corrected time" in source)
-    check("strategy samples CLOB-aligned wall time",
-          "sampled_wall = timer.wall()" in source)
+          and "Unix 5-minute windows" in source)
+    check("strategy samples Unix time for round identity",
+          "sampled_wall = timer.unix()" in source)
 
 
 class _ClockResp:
@@ -499,6 +503,8 @@ def t_clock_offset_aligns_round_identity_to_clob():
         residual = timer.wall() - (time.time() + server_ahead)
         check("wall() tracks CLOB time within a few hundred ms",
               abs(residual) < 0.25, f"{residual:.4f}s")
+        check("window_start ignores CLOB offset and stays on Unix",
+              timer.window_start() == timer.window_start(time.time()))
         explicit = 1_786_320_017.4
         check("explicit timestamps are not shifted",
               timer.window_start(explicit) == 1_786_320_000)
@@ -844,6 +850,7 @@ async def t_transient_unfillable_book_is_retried_next_attempt():
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot",
                 lambda *_a, **_k: (101.0, (active + 100) * 1000))
+        replace(main_bot.timer, "unix", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "wall", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "check_clock",
                 lambda *_a, **_k: (True, "clock synchronized", 0.0))
@@ -851,9 +858,6 @@ async def t_transient_unfillable_book_is_retried_next_attempt():
         replace(main_bot.config, "TRADE_LAST_SECONDS", 300)
         replace(main_bot.config, "MAX_ROUND_EXPOSURE", 100.0)
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
-        # This case is about the signal path, so pin the phases: phase 1 owns
-        # the same seconds and would otherwise answer first.
-        replace(main_bot.config, "PHASE1_ENABLED", False)
         replace(main_bot.config, "PHASE2_ENABLED", True)
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -869,103 +873,6 @@ async def t_transient_unfillable_book_is_retried_next_attempt():
           str(calls))
     check("the failed attempt remains visible in the journal",
           rows and rows[0]["result"] == "skipped_unfillable", str(rows))
-
-
-async def _drive_phase1(books, *, remaining=200.0, timeout=1.5,
-                        bands=((300, 120, 0.25, 0.50, 12.0),),
-                        held_provider=None, exposure_provider=None,
-                        execution_mode="PAPER", execution_ready_provider=None,
-                        price_samples=None):
-    """Run one phase-1 pass against a fixed pair of books. Returns what it did."""
-    import main_bot
-
-    active = 1_786_320_000
-    seen = {"orders": [], "rows": [], "price_samples": 0,
-            "executor_guards": []}
-    samples = list(price_samples if price_samples is not None else (99.0, 99.0, 99.0))
-
-    def fresh_price(*_a, **_k):
-        index = min(seen["price_samples"], len(samples) - 1)
-        seen["price_samples"] += 1
-        value = samples[index]
-        return ((None, None) if value is None else
-                (float(value), (active + 100) * 1000))
-
-    class Strike:
-        def strike_for(self, _window):
-            return Decimal("100")
-
-        def current_value(self):
-            return Decimal("100")
-
-        def divergence(self, *_a):
-            return {"diff": None}
-
-    def submit(side, *args, **kwargs):
-        guard = kwargs.get("pre_submit_guard")
-        allowed = guard() if callable(guard) else None
-        seen["executor_guards"].append(allowed)
-        if allowed is not True:
-            main_bot.stop_event.set()
-            return False
-        seen["orders"].append(side)
-        # the band's ceiling travels with the order as its price cap
-        seen["caps"] = seen.get("caps", [])
-        seen["caps"].append(kwargs.get("max_price", args[-1] if args else None))
-        main_bot.stop_event.set()
-        return True
-
-    saved = []
-
-    def replace(obj, name, value):
-        saved.append((obj, name, getattr(obj, name)))
-        setattr(obj, name, value)
-
-    try:
-        is_paper = execution_mode == "PAPER"
-        replace(main_bot, "execution_mode", execution_mode)
-        replace(main_bot, "_paper_broker", object() if is_paper else None)
-        replace(main_bot, "_round_exposure_provider", exposure_provider)
-        replace(main_bot, "_round_held_tokens_provider", held_provider)
-        replace(main_bot, "_execution_ready_provider", execution_ready_provider)
-        replace(main_bot, "_strike", Strike())
-        replace(main_bot, "get_balance_allowance",
-                lambda: {"balance": 1000.0, "allowance": 1000.0})
-        replace(main_bot, "place_trade", submit)
-        replace(main_bot, "_append_trade", lambda row: seen["rows"].append(row))
-        replace(main_bot.polymarket_trade, "live_execution_disabled", lambda: is_paper)
-        replace(main_bot.market_discovery, "get_tokens_for_current_round", lambda _w: {
-            "window_start": active, "window_end": active + 300,
-            "up_token_id": "11", "down_token_id": "12",
-            "orderbook_token_id": "11", "condition_id": "0x" + "a" * 64,
-        })
-        replace(main_bot.orderbook, "get_orderbook",
-                lambda token, *_a, **_k: books[str(token)])
-        replace(main_bot.orderbook, "validate_buy_liquidity",
-                lambda *_a, **_k: books["11"])
-        replace(main_bot.price_ws, "latest_snapshot",
-                lambda: (100.0, time.monotonic(), (active + 1) * 1000))
-        replace(main_bot.price_ws, "fresh_snapshot", fresh_price)
-        replace(main_bot.timer, "wall", lambda *_a, **_k: active + (300.0 - remaining))
-        replace(main_bot.timer, "check_clock",
-                lambda *_a, **_k: (True, "clock synchronized", 0.0))
-        replace(main_bot.config, "PHASE1_ENABLED", True)
-        replace(main_bot.config, "PHASE2_ENABLED", False)
-        replace(main_bot.config, "PHASE1_INTERVAL_SECONDS", 0.01)
-        replace(main_bot.config, "PHASE1_BANDS", tuple(bands))
-        replace(main_bot.config, "BET_SIZE", 2.50)
-        replace(main_bot.config, "MAX_ROUND_EXPOSURE", 100.0)
-        replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
-        main_bot.stop_event.clear()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(main_bot.run_bot(), timeout=timeout)
-    finally:
-        main_bot.stop_event.set()
-        for obj, name, value in reversed(saved):
-            setattr(obj, name, value)
-        main_bot.stop_event.clear()
-    return seen
 
 
 def _book(ask):
@@ -1063,10 +970,10 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot",
                 lambda *_a, **_k: (101.0, (active + 100) * 1000))
+        replace(main_bot.timer, "unix", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "wall", lambda *_a, **_k: active + 100.0)
         replace(main_bot.timer, "check_clock",
                 lambda *_a, **_k: (True, "clock synchronized", 0.0))
-        replace(main_bot.config, "PHASE1_ENABLED", False)
         replace(main_bot.config, "PHASE2_ENABLED", True)
         replace(main_bot.config, "TRADE_INTERVAL_SECONDS", 0.01)
         replace(main_bot.config, "TRADE_LAST_SECONDS", 300)
@@ -1083,79 +990,6 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             setattr(obj, name, value)
         main_bot.stop_event.clear()
     return seen
-
-
-async def t_phase1_buys_whichever_leg_is_in_the_band():
-    seen = await _drive_phase1({"11": _book(0.60), "12": _book(0.40)})
-    check("phase 1 takes the leg inside the band, not the favourite",
-          seen["orders"] == ["DOWN"], str(seen["orders"]))
-    row = seen["rows"][0] if seen["rows"] else {}
-    check("the fill is tagged phase1", row.get("phase") == "phase1", str(row))
-    check("phase 1 records the fresh price signal that authorized the side",
-          row.get("price_side") == "DOWN" and row.get("book_side") == ""
-          and row.get("chainlink_side") == "", str(row))
-    check("phase 1 supplies a passing executor-side SIG PRICE permit",
-          seen["executor_guards"] == [True], str(seen))
-
-
-async def t_phase1_price_signal_is_a_hard_order_gate():
-    books = {"11": _book(0.60), "12": _book(0.40)}
-    opposite = await _drive_phase1(
-        books, timeout=0.55, price_samples=(101.0, 101.0, 101.0))
-    check("phase 1 cannot buy opposite fresh SIG PRICE",
-          opposite["orders"] == [], str(opposite))
-
-    neutral = await _drive_phase1(
-        books, timeout=0.55, price_samples=(100.0, 100.0, 100.0))
-    check("phase 1 skips a neutral price signal",
-          neutral["orders"] == [], str(neutral))
-
-    stale = await _drive_phase1(
-        books, timeout=0.55, price_samples=(99.0, None, None))
-    check("phase 1 skips when SIG PRICE becomes stale during validation",
-          stale["orders"] == [], str(stale))
-
-    flipped = await _drive_phase1(
-        books, timeout=0.55, price_samples=(99.0, 99.0, 101.0))
-    check("phase 1 skips a last-moment SIG PRICE flip",
-          flipped["orders"] == [] and flipped["price_samples"] >= 3,
-          str(flipped))
-
-
-async def t_restart_held_up_blocks_phase1_down_in_paper_and_live():
-    condition = "0x" + "a" * 64
-    books = {"11": _book(0.60), "12": _book(0.40)}
-    paper_calls = []
-
-    def paper_held(window, discovered_condition):
-        paper_calls.append((window, discovered_condition))
-        return {"11"} if discovered_condition == condition else set()
-
-    paper = await _drive_phase1(
-        books, timeout=0.55, held_provider=paper_held,
-        exposure_provider=lambda _window, _condition: 0.0,
-        execution_mode="PAPER")
-    check("paper restart refreshes held UP after condition discovery",
-          any(discovered == condition for _window, discovered in paper_calls),
-          str(paper_calls))
-    check("paper restart blocks phase-1 DOWN complement",
-          paper["orders"] == [], str(paper["orders"]))
-
-    live_calls = []
-
-    def live_held(window, discovered_condition):
-        live_calls.append((window, discovered_condition))
-        return {"11"}
-
-    live = await _drive_phase1(
-        books, timeout=0.55, held_provider=live_held,
-        exposure_provider=lambda _window, _condition: 0.0,
-        execution_mode="LIVE",
-        execution_ready_provider=lambda _condition: True)
-    check("live restart restores accepted UP at round start",
-          live_calls and live_calls[0][1] is None, str(live_calls))
-    check("live restart blocks phase-1 DOWN complement",
-          live["orders"] == [], str(live["orders"]))
 
 
 async def t_restart_held_up_blocks_phase2_down_in_paper_and_live():
@@ -1314,22 +1148,7 @@ async def t_signal_flip_mode_never_loosens_live_or_inflight_guards():
           stale_gap["order_sides"] == ["UP"], str(stale_gap))
 
 
-async def t_live_execution_readiness_gates_both_phase_submissions():
-    books = {"11": _book(0.60), "12": _book(0.40)}
-    phase1_checks = {"n": 0}
-
-    def phase1_drops(_condition):
-        phase1_checks["n"] += 1
-        return phase1_checks["n"] == 1
-
-    phase1 = await _drive_phase1(
-        books, timeout=0.55, held_provider=lambda *_a: set(),
-        exposure_provider=lambda *_a: 0.0, execution_mode="LIVE",
-        execution_ready_provider=phase1_drops)
-    check("phase 1 rechecks private-stream readiness immediately before submit",
-          phase1_checks["n"] >= 2 and phase1["orders"] == [],
-          f"checks={phase1_checks} orders={phase1['orders']}")
-
+async def t_live_execution_readiness_gates_phase2_submission():
     phase2_checks = {"n": 0}
 
     def phase2_drops(_condition):
@@ -1344,53 +1163,6 @@ async def t_live_execution_readiness_gates_both_phase_submissions():
           and phase2["orders"] == 0,
           f"checks={phase2_checks} seen={phase2}")
 
-    paper = await _drive_phase1(
-        books, held_provider=lambda *_a: set(),
-        exposure_provider=lambda *_a: 0.0, execution_mode="PAPER",
-        execution_ready_provider=lambda _condition: False)
-    check("paper execution is independent of private user-stream readiness",
-          paper["orders"] == ["DOWN"], str(paper["orders"]))
-
-
-async def t_phase1_uses_the_band_for_the_window_it_is_in():
-    """Same book, two windows, two answers: the bands must actually differ."""
-    windows = ((300, 240, 0.35, 0.45, 12.0), (240, 180, 0.30, 0.40, 12.0))
-    books = {"11": _book(0.80), "12": _book(0.44)}
-    early = await _drive_phase1(books, remaining=280.0, bands=windows)
-    check("0.44 is inside the opening band, so it trades",
-          early["orders"] == ["DOWN"], str(early["orders"]))
-    check("the order carries that window's ceiling as its cap",
-          early.get("caps") == [0.45], str(early.get("caps")))
-    later = await _drive_phase1(books, remaining=200.0, bands=windows, timeout=0.6)
-    check("the same 0.44 is outside the next window's band, so it does not",
-          later["orders"] == [], str(later["orders"]))
-
-
-async def t_phase1_caps_the_order_at_the_band_ceiling():
-    seen = await _drive_phase1({"11": _book(0.60), "12": _book(0.40)},
-                               bands=((300, 120, 0.30, 0.40, 12.0),))
-    check("a phase 1 order is capped at its band, not the account ceiling",
-          seen.get("caps") == [0.40], str(seen.get("caps")))
-
-
-async def t_phase1_skips_when_no_leg_is_in_the_band():
-    seen = await _drive_phase1({"11": _book(0.60), "12": _book(0.55)}, timeout=0.6)
-    check("no leg in band means no order", seen["orders"] == [], str(seen["orders"]))
-
-
-async def t_phase1_refuses_a_pair_that_prices_as_arbitrage():
-    # Both legs under 0.50 means the pair sums below $1.
-    seen = await _drive_phase1({"11": _book(0.45), "12": _book(0.40)}, timeout=0.6)
-    check("both legs in band is refused rather than picked at random",
-          seen["orders"] == [], str(seen["orders"]))
-
-
-async def t_phase1_respects_the_window():
-    seen = await _drive_phase1({"11": _book(0.60), "12": _book(0.40)},
-                               remaining=60.0, timeout=0.6)
-    check("phase 1 does not trade after its window closes",
-          seen["orders"] == [], str(seen["orders"]))
-
 
 def t_submission_path_revalidates_every_signal_and_latency():
     source = pathlib.Path("main_bot.py").read_text(encoding="utf-8")
@@ -1404,8 +1176,8 @@ def t_submission_path_revalidates_every_signal_and_latency():
           "final_book_side = orderbook.liquidity_signal" in source)
     check("submission path refuses a changed fresh price signal",
           "if submit_price_side != side:" in source)
-    check("both phases perform an immediate price-side submission gate",
-          source.count("submit_price_side = price_signal(") == 2,
+    check("phase 2 performs an immediate price-side submission gate",
+          source.count("submit_price_side = price_signal(") == 1,
           str(source.count("submit_price_side = price_signal(")))
     check("submission path bounds end-to-end validation latency",
           "validation_age > validation_limit" in source)
@@ -1473,99 +1245,36 @@ def _reload_config(**env):
         importlib.reload(cfg)
 
 
-def t_phase1_config_rejects_impossible_settings():
-    check("a window that runs forwards in time-remaining is refused",
-          "end < start" in (_reload_config(PHASE1_BANDS="100:200:0.30:0.40") or "").lower(),
-          str(_reload_config(PHASE1_BANDS="100:200:0.30:0.40")))
-    check("a malformed band entry is refused",
-          "start:end:low:high" in (_reload_config(PHASE1_BANDS="300:240:0.30") or ""),
-          str(_reload_config(PHASE1_BANDS="300:240:0.30")))
-    check("an inverted band is refused",
-          "low < high" in (_reload_config(PHASE1_BANDS="300:240:0.60:0.30") or ""),
-          str(_reload_config(PHASE1_BANDS="300:240:0.60:0.30")))
-    check("overlapping windows are refused",
-          "overlap" in (_reload_config(
-              PHASE1_BANDS="300:200:0.30:0.40,240:180:0.30:0.40") or ""),
-          str(_reload_config(PHASE1_BANDS="300:200:0.30:0.40,240:180:0.30:0.40")))
-    check("a cadence longer than the narrowest window is refused",
-          "narrowest" in (_reload_config(PHASE1_INTERVAL_SECONDS="600") or ""),
-          str(_reload_config(PHASE1_INTERVAL_SECONDS="600")))
-    # The venue minimum is a share count, so the top of the band binds.
-    check("a stake that cannot buy the venue minimum at the band top is refused",
-          "venue minimum" in (_reload_config(BET_SIZE="1.00") or ""),
-          str(_reload_config(BET_SIZE="1.00")))
-    check("the shipped defaults are self-consistent", _reload_config() is None)
-
-
-def t_paper_signal_flip_config_requires_one_non_band_phase():
-    overlapping = _reload_config(
-        PAPER_ALLOW_SIGNAL_FLIPS="1", PHASE1_ENABLED="1", PHASE2_ENABLED="1")
-    check("signal-flip experiment rejects overlapping Phase 1 cadence",
-          overlapping is not None and "PHASE1_ENABLED=0" in overlapping,
-          str(overlapping))
-
+def t_signal_flip_config_requires_phase_two():
     parked = _reload_config(
-        PAPER_ALLOW_SIGNAL_FLIPS="1", PHASE1_ENABLED="0", PHASE2_ENABLED="0")
-    check("signal-flip experiment requires the no-band Phase 2 path",
+        PAPER_ALLOW_SIGNAL_FLIPS="1", PHASE2_ENABLED="0")
+    check("signal-flip experiment requires PHASE2_ENABLED=1",
           parked is not None and "PHASE2_ENABLED=1" in parked, str(parked))
 
-    check("explicit single Phase 2 signal-flip configuration loads",
-          _reload_config(PAPER_ALLOW_SIGNAL_FLIPS="1", PHASE1_ENABLED="0",
+    check("explicit Phase 2 signal-flip configuration loads",
+          _reload_config(PAPER_ALLOW_SIGNAL_FLIPS="1",
                          PHASE2_ENABLED="1") is None)
     check("signal flips remain off by default",
           _reload_config(PAPER_ALLOW_SIGNAL_FLIPS="0") is None)
 
 
-def t_phase1_bands_select_by_seconds_remaining():
-    import config as cfg
-
-    check("the open uses the first band", cfg.phase1_band(280)[2:4] == (0.35, 0.45),
-          str(cfg.phase1_band(280)))
-    check("mid-round uses the second band", cfg.phase1_band(200)[2:4] == (0.30, 0.40),
-          str(cfg.phase1_band(200)))
-    check("the last phase-1 window uses the third band",
-          cfg.phase1_band(150)[2:4] == (0.40, 0.50), str(cfg.phase1_band(150)))
-    check("a boundary belongs to the later window",
-          cfg.phase1_band(240)[2:4] == (0.30, 0.40), str(cfg.phase1_band(240)))
-    check("the T-120 window is now a band too, at its own cadence",
-          cfg.phase1_band(120)[2:] == (0.55, 0.75, 8.0), str(cfg.phase1_band(120)))
-    check("the closed final minute has no band", cfg.phase1_band(59) is None)
-    check("before the round opens there is no band", cfg.phase1_band(301) is None)
-
-
 def t_round_exposure_follows_the_enabled_phases():
     import importlib
-    import math
     import os
     import config as cfg
 
     saved = dict(os.environ)
     try:
-        os.environ.update({"PHASE1_ENABLED": "1", "PHASE2_ENABLED": "0",
-                           "BET_SIZE": "2.50"})
+        os.environ.update({"PHASE2_ENABLED": "0", "BET_SIZE": "2.50"})
         importlib.reload(cfg)
-        phase1_only = cfg.MAX_ROUND_EXPOSURE
-        # Bands may carry their own cadence, so the budget is the sum of each
-        # window's own slot count, not one global division.
-        # The budget is CASH, not a slot count: the broker sizes up to the
-        # 5-share venue minimum and the fee lands on top, so each band is
-        # reserved at the ceiling price it can actually fill at.
-        slots = sum(math.ceil((s - e) / (cfg.PHASE1_INTERVAL_SECONDS if i is None else i))
-                    for s, e, _lo, _hi, i in cfg.PHASE1_BANDS)
-        expected = sum(
-            math.ceil((s - e) / (cfg.PHASE1_INTERVAL_SECONDS if i is None else i))
-            * cfg.entry_cost_ceiling(hi)
-            for s, e, _lo, hi, i in cfg.PHASE1_BANDS)
-        check("phase 1 budgets each band at its own cadence",
-              abs(phase1_only - expected) < 1e-9,
-              f"{phase1_only} vs {expected} over {slots} slots")
-        check("a band priced above BET_SIZE/5 reserves more than the bet",
-              phase1_only > slots * cfg.BET_SIZE,
-              f"{phase1_only} vs {slots * cfg.BET_SIZE}")
+        parked = cfg.MAX_ROUND_EXPOSURE
+        check("parked phase 2 still reserves at least one entry",
+              parked >= cfg.entry_cost_ceiling(cfg.MAX_BUY_PRICE) - 1e-9,
+              f"{parked}")
         os.environ["PHASE2_ENABLED"] = "1"
         importlib.reload(cfg)
         check("switching phase 2 on raises the cap, it does not stay stale",
-              cfg.MAX_ROUND_EXPOSURE > phase1_only, str(cfg.MAX_ROUND_EXPOSURE))
+              cfg.MAX_ROUND_EXPOSURE > parked, str(cfg.MAX_ROUND_EXPOSURE))
     finally:
         os.environ.clear()
         os.environ.update(saved)

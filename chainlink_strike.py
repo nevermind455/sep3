@@ -52,14 +52,12 @@ E18 = Decimal(10) ** 18
 
 
 def window_start(ts: float | None = None, window: int = WINDOW) -> int:
-    # Round identity must use the same CLOB-corrected clock as discovery,
-    # execution and the Binance feed.  A machine a few seconds fast/slow can
-    # otherwise mark a connection as belonging to the wrong five-minute
-    # window and either discard the real boundary observation or accept one
-    # from a connection opened after the boundary.
+    # Round identity must use Unix, the same clock as discovery, market slugs,
+    # and Binance trade timestamps. CLOB ``/time`` can lag; using it here
+    # made the current round overrun and the next one open late.
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         raise ValueError("window must be a positive integer")
-    t = int(timer.wall() if ts is None else ts)
+    t = int(timer.unix() if ts is None else ts)
     return t - (t % window)
 
 

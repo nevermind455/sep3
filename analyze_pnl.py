@@ -285,12 +285,8 @@ def by_signal(fills: list[dict], since: float) -> None:
         sides = [row["price_side"], row["book_side"], row["chainlink_side"]]
         live = [s for s in sides if s]
         agree = sum(1 for s in live if s == order["side"])
-        # Legacy phase-1 rows wrote empty signal columns.  Current phase-1
-        # rows persist the Binance price vote that authorized their side, so
-        # they naturally enter the live-signal branch below.  Preserve a clear
-        # label for old rows instead of misreporting them as 0/3 disagreement.
         vote_key = (f"{agree}/{len(live)} backed the side taken" if live
-                    else "no signal recorded (legacy phase 1)")
+                    else "no signal recorded")
         for bucket, key in ((combos, tuple(s or "-" for s in sides)),
                             (votes, vote_key)):
             b = bucket[key]

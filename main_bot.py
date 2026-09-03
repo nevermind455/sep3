@@ -15,6 +15,7 @@ import price_ws
 import strategy
 import polymarket_trade
 import timer
+import late_trim
 from polymarket_trade import cancel_all_open_orders, get_balance_allowance, place_trade
 from timer import current_round_window_et, now_et, seconds_left
 
@@ -44,6 +45,8 @@ _round_held_tokens_provider = None
 # pair-lock guard reads it; without it that guard stays closed.
 _round_leg_basis_provider = None
 _execution_ready_provider = None
+_round_inventory_provider = None
+_late_trim_status: dict = {}
 
 # Set by run_feeds / run_terminal when the RTDS 60-second TWAP feed is running.
 # The direct main_bot.py entrypoint creates the same service itself.
@@ -146,7 +149,7 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
     if expected_side not in ("UP", "DOWN") or start_price is None:
         return False
     try:
-        sampled_wall = timer.wall()
+        sampled_wall = timer.unix()
         if timer.window_start(sampled_wall) != round_key:
             if signal_observer is not None:
                 signal_observer(None)
@@ -172,6 +175,202 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
             except Exception:
                 pass
         return False
+
+
+def _late_trim_amount() -> float:
+    from decimal import Decimal
+    value = (Decimal(str(config.BET_SIZE))
+             * Decimal(str(config.LATE_TRIM_CLIP_MULT)))
+    return float(value.quantize(Decimal("0.01")))
+
+
+def _in_late_trim_window(remaining: float) -> bool:
+    return (config.LATE_TRIM_ENABLED
+            and config.LATE_TRIM_CUTOFF_SECONDS < remaining
+            <= config.LATE_TRIM_START_SECONDS)
+
+
+def _inventory_legs(condition_id, up_id, down_id):
+    inv = {}
+    if _round_inventory_provider is not None:
+        try:
+            inv = _round_inventory_provider(condition_id) or {}
+        except Exception:
+            inv = {}
+    up = inv.get(str(up_id)) or {}
+    down = inv.get(str(down_id)) or {}
+    return (
+        float(up.get("shares") or 0.0), float(up.get("cost") or 0.0),
+        float(down.get("shares") or 0.0), float(down.get("cost") or 0.0),
+    )
+
+
+def _best_quote(token_id):
+    bids, asks = orderbook.get_orderbook(token_id)
+    ask = float(asks[0]["price"]) if asks else None
+    bid = float(bids[0]["price"]) if bids else None
+    return bid, ask
+
+
+def _set_late_trim_status(decision: dict, *, clips: int, remaining: float | None) -> None:
+    global _late_trim_status
+    _late_trim_status = {
+        "enabled": bool(config.LATE_TRIM_ENABLED),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "side": decision.get("side"),
+        "hole": decision.get("hole"),
+        "if_up": decision.get("if_up"),
+        "if_down": decision.get("if_down"),
+        "ask": decision.get("ask"),
+        "clips": clips,
+        "max_clips": config.LATE_TRIM_MAX_CLIPS,
+        "amount": _late_trim_amount() if config.LATE_TRIM_ENABLED else None,
+        "remaining": remaining,
+    }
+
+
+async def _run_late_trim(mode, exact_remaining, active_window, round_end,
+                         start_price, start_chainlink_price, lp,
+                         round_exposure, held_tokens, signal_epoch, trim):
+    """One last-minute trim attempt. Does not open the normal entry window."""
+    now_mono = asyncio.get_running_loop().time()
+    last_age = (None if trim["last_mono"] is None
+                else now_mono - trim["last_mono"])
+    empty = late_trim.evaluate_late_trim(
+        enabled=config.LATE_TRIM_ENABLED,
+        remaining=exact_remaining,
+        start=config.LATE_TRIM_START_SECONDS,
+        cutoff=config.LATE_TRIM_CUTOFF_SECONDS,
+        clips_used=trim["clips"],
+        max_clips=config.LATE_TRIM_MAX_CLIPS,
+        interval_s=config.LATE_TRIM_INTERVAL_SECONDS,
+        last_clip_age_s=last_age,
+        up_shares=0.0, up_cost=0.0, down_shares=0.0, down_cost=0.0,
+        up_ask=None, down_ask=None,
+        ask_min=config.LATE_TRIM_ASK_MIN, ask_max=config.LATE_TRIM_ASK_MAX,
+        price_side=None, chainlink_side=None,
+        amount=_late_trim_amount(),
+    )
+    tokens = await asyncio.to_thread(
+        market_discovery.get_tokens_for_current_round, active_window)
+    if not tokens or tokens.get("window_end") != round_end:
+        empty["reason"] = "no market tokens"
+        _set_late_trim_status(empty, clips=trim["clips"], remaining=exact_remaining)
+        await asyncio.sleep(0.2)
+        return round_exposure, held_tokens
+    up_id, down_id = tokens["up_token_id"], tokens["down_token_id"]
+    condition_id = tokens["condition_id"]
+    round_exposure, held_tokens = _refresh_durable_round_state(
+        active_window, condition_id, round_exposure, held_tokens)
+    up_sh, up_c, dn_sh, dn_c = _inventory_legs(condition_id, up_id, down_id)
+    up_bid = up_ask = dn_bid = dn_ask = None
+    try:
+        up_bid, up_ask = await asyncio.to_thread(_best_quote, up_id)
+    except Exception:
+        up_bid = up_ask = None
+    try:
+        dn_bid, dn_ask = await asyncio.to_thread(_best_quote, down_id)
+    except Exception:
+        dn_bid = dn_ask = None
+    price_side = price_signal(active_window, start_price, lp)
+    chainlink_side = chainlink_signal(
+        active_window, start_chainlink_price, current_chainlink_twap())
+    if price_side is not None:
+        signal_epoch.observe(price_side)
+    stop_blocks = False
+    if config.STOP_LOSS_ENABLED:
+        remain = exact_remaining
+        armed = (config.STOP_LOSS_EXIT_CUTOFF_SECONDS < remain
+                 <= config.STOP_LOSS_ARM_SECONDS)
+        # Don't buy a token the stop is trying to dump.
+        if armed:
+            paths = late_trim.settlement_paths(up_sh, up_c, dn_sh, dn_c)
+            strong = "UP" if paths["if_up"] < 0 <= paths["if_down"] else (
+                "DOWN" if paths["if_down"] < 0 <= paths["if_up"] else None)
+            bid = up_bid if strong == "UP" else dn_bid if strong == "DOWN" else None
+            if bid is not None and bid <= config.STOP_LOSS_PRICE:
+                stop_blocks = True
+    decision = late_trim.evaluate_late_trim(
+        enabled=config.LATE_TRIM_ENABLED,
+        remaining=exact_remaining,
+        start=config.LATE_TRIM_START_SECONDS,
+        cutoff=config.LATE_TRIM_CUTOFF_SECONDS,
+        clips_used=trim["clips"],
+        max_clips=config.LATE_TRIM_MAX_CLIPS,
+        interval_s=config.LATE_TRIM_INTERVAL_SECONDS,
+        last_clip_age_s=last_age,
+        up_shares=up_sh, up_cost=up_c, down_shares=dn_sh, down_cost=dn_c,
+        up_ask=up_ask, down_ask=dn_ask,
+        ask_min=config.LATE_TRIM_ASK_MIN, ask_max=config.LATE_TRIM_ASK_MAX,
+        price_side=price_side, chainlink_side=chainlink_side,
+        amount=_late_trim_amount(),
+        stop_blocks=stop_blocks,
+    )
+    _set_late_trim_status(decision, clips=trim["clips"], remaining=exact_remaining)
+    if decision["action"] != "buy":
+        if trim.get("last_reason") != decision["reason"]:
+            print(f"{_ts()} [TRIM] skip: {decision['reason']}")
+            trim["last_reason"] = decision["reason"]
+        await asyncio.sleep(0.2)
+        return round_exposure, held_tokens
+    side = decision["side"]
+    amount = decision["amount"]
+    ceiling = config.entry_cost_ceiling(config.LATE_TRIM_ASK_MAX)
+    if round_exposure + ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:
+        print(f"{_ts()} [TRIM] skip: exposure cap "
+              f"(${round_exposure:.2f}/${config.MAX_ROUND_EXPOSURE:.2f})")
+        await asyncio.sleep(0.2)
+        return round_exposure, held_tokens
+    if not _execution_ready(mode, condition_id):
+        print(f"{_ts()} [TRIM] skip: private fill stream not ready")
+        await asyncio.sleep(0.2)
+        return round_exposure, held_tokens
+    verb = "Simulating trim FOK" if mode == "PAPER" else "Placing trim FOK"
+    print(
+        f"{_ts()} [TRIM] {verb}: {side} ${amount:.2f} @<{config.LATE_TRIM_ASK_MAX:.2f} "
+        f"hole ${decision['hole']:.2f} ({trim['clips'] + 1}/"
+        f"{config.LATE_TRIM_MAX_CLIPS})"
+    )
+    ok = await asyncio.to_thread(
+        place_trade, side, amount, up_id, down_id, condition_id, round_end,
+        decision["max_price"],
+        pre_submit_guard=lambda: _fresh_price_permit(
+            active_window, start_price, side,
+            signal_observer=signal_epoch.observe),
+        min_expiry=config.LATE_TRIM_CUTOFF_SECONDS)
+    result = "rejected_or_unsubmitted"
+    if ok:
+        round_exposure += ceiling
+        held_tokens.add(up_id if side == "UP" else down_id)
+        signal_epoch.record_accepted(side)
+        trim["clips"] += 1
+        trim["last_mono"] = asyncio.get_running_loop().time()
+        trim["last_reason"] = "filled"
+        result = "paper_filled" if mode == "PAPER" else (
+            polymarket_trade.last_order_status or
+            "accepted_pending_confirmation").lower()
+        print(f"{_ts()} [TRIM] filled {side} ({trim['clips']}/"
+              f"{config.LATE_TRIM_MAX_CLIPS})")
+    else:
+        reason = polymarket_trade.last_order_error or "unknown"
+        if mode == "PAPER" and _paper_broker is not None:
+            reason = _paper_broker.last_error or reason
+        print(f"{_ts()} [TRIM] not placed: {reason}")
+        trim["last_reason"] = reason
+    _append_trade({
+        "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
+        "phase": "late_trim",
+        "side": side,
+        "amount": amount,
+        "price_side": price_side or "",
+        "book_side": "",
+        "chainlink_side": chainlink_side or "",
+        "result": result,
+    })
+    _set_late_trim_status(decision, clips=trim["clips"], remaining=exact_remaining)
+    await asyncio.sleep(0.2)
+    return round_exposure, held_tokens
 
 
 def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
@@ -277,8 +476,22 @@ class _RoundSignalEpoch:
         if self.accepted_side is None or self.accepted_epoch is None:
             return False, "last accepted side is unavailable"
         if self.observed_side != side or self.epoch <= self.accepted_epoch:
-            return False, "no later non-neutral SIG PRICE transition was observed"
-        return True, "verified SIG PRICE transition"
+            return False, ("no later non-neutral transition of the deciding "
+                           "signal was observed")
+        return True, "verified transition of the deciding signal"
+
+
+def _authority_side(price_side, book_side, chainlink_side):
+    """The signal that actually decides the order side under this config.
+
+    The round epoch has to track whatever drives execution. Under the minority
+    rule the decision can flip because BOOK or CHAINLINK moved while SIG PRICE
+    stood still, and an epoch watching SIG PRICE alone would call that "no
+    transition" - refusing the very complement the flip was supposed to buy.
+    """
+    if config.SIGNAL_MINORITY_RULE:
+        return strategy.minority_decision(price_side, book_side, chainlink_side)
+    return price_side
 
 
 stop_event = threading.Event()
@@ -305,8 +518,7 @@ def _rotate_trade_log_if_stale() -> bool:
     """Move an old-schema log aside once, rather than mixing column counts.
 
     A file whose header lacks `phase` cannot hold the new rows: csv readers
-    key off the header, so the extra value would be silently dropped and the
-    analysis would read phase 1 and phase 2 as one undifferentiated blob.
+    key off the header, so the extra value would be silently dropped.
     """
     if not TRADE_LOG.exists():
         return False
@@ -347,9 +559,23 @@ def _append_trade(row):
 
 
 async def _cooldown(seconds: float | None = None) -> None:
+    """Wait out the trade interval, but never across a round boundary.
+
+    BUGFIX: this used to be a flat TRADE_INTERVAL_SECONDS sleep that only woke
+    for shutdown. Round rotation and the opening-print latch both live at the
+    TOP of the strategy loop, so a cooldown beginning a second or two before a
+    boundary held the loop for the rest of its 12s - and the new round was not
+    detected until ~10s in. By then the opening print, which is only latchable
+    from a trade stamped in the first 5 seconds, was already unreachable and
+    the round was lost. Returning at the boundary costs nothing: the loop
+    re-enters, sees the new window, and the interval restarts naturally.
+    """
     gap = config.TRADE_INTERVAL_SECONDS if seconds is None else seconds
     deadline = time.monotonic() + gap
+    entry_window = timer.window_start()
     while time.monotonic() < deadline and not stop_event.is_set():
+        if timer.window_start() != entry_window:
+            return
         await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
@@ -450,8 +676,8 @@ async def run_bot():
     last_status = 0.0
     skip_logged_window = None
     held_tokens: set[str] = set()
-    last_phase1 = 0.0
     signal_epoch = _RoundSignalEpoch()
+    trim = {"clips": 0, "last_mono": None, "last_reason": None}
 
     mode = str(execution_mode or "LIVE").upper()
     if mode not in {"LIVE", "PAPER"}:
@@ -475,18 +701,16 @@ async def run_bot():
         f"{_ts()} [BOT] Time check: now {now_et().strftime('%b %d %H:%M:%S ET')} | "
         f"current round {current_round_window_et()} (compare with Polymarket)"
     )
-    # Phase-1 band sizing notes describe orders phase 1 would place. Printing
-    # them while phase 1 is off says the bot will do something it will not,
-    # and sends anyone reading the log looking at the wrong price range.
-    for s, e, lo, hi, need_lo, need_hi in (
-            getattr(config, "PHASE1_STAKE_NOTES", ())
-            if config.PHASE1_ENABLED else ()):
-        print(
-            f"{_ts()} [BOT] NOTE: band {lo:.2f}-{hi:.2f} (T-{s}..T-{e}) exceeds "
-            f"BET_SIZE/5, so the venue's 5-share minimum will size those orders "
-            f"to ${need_lo:.2f}-${need_hi:.2f} instead of ${config.BET_SIZE:.2f}."
-        )
     print(f"{_ts()} [BOT] Kill switch: press Enter in this terminal to stop safely.")
+    if config.LATE_TRIM_ENABLED:
+        print(
+            f"{_ts()} [TRIM] last-minute loss trim ON | "
+            f"T-{config.LATE_TRIM_START_SECONDS:.0f}..T-{config.LATE_TRIM_CUTOFF_SECONDS:.0f} | "
+            f"{config.LATE_TRIM_MAX_CLIPS} clips x ${_late_trim_amount():.2f} | "
+            f"ask {config.LATE_TRIM_ASK_MIN:.2f}-{config.LATE_TRIM_ASK_MAX:.2f}"
+        )
+    else:
+        print(f"{_ts()} [TRIM] last-minute loss trim OFF (LATE_TRIM_ENABLED=0)")
 
     bal = await asyncio.to_thread(get_balance_allowance)
     if bal:
@@ -505,7 +729,8 @@ async def run_bot():
     if drift is not None:
         print(
             f"{_ts()} [CLOCK] {clock_detail}; "
-            f"round timing uses CLOB-corrected time ({timer.clock_offset():+.3f}s local offset)"
+            f"round windows use Unix time, CLOB offset {timer.clock_offset():+.3f}s "
+            f"applies only to book timestamps"
         )
     else:
         print(f"{_ts()} [CLOCK] {clock_detail}")
@@ -520,7 +745,7 @@ async def run_bot():
             print(
                 f"{_ts()} [CLOCK] WARN: local clock is past the "
                 f"{config.CLOCK_MAX_DRIFT_SECONDS:.3f}s live limit; PAPER continues "
-                "on CLOB-corrected time so round identity matches Polymarket."
+                "and keeps Unix 5-minute windows so rounds match Polymarket slugs."
             )
         else:
             print(
@@ -531,7 +756,7 @@ async def run_bot():
     print(f"{_ts()} [BOT] Strategy loop started. Waiting for price feed and next round (ET)...")
 
     while not stop_event.is_set():
-        sampled_wall = timer.wall()
+        sampled_wall = timer.unix()
         remain = seconds_left(sampled_wall)
         round_window = timer.window_start(sampled_wall)
         round_end = round_window + 300
@@ -553,11 +778,10 @@ async def run_bot():
             # that just closed would read as activity in this market, so the
             # log restarts at the boundary. trade_log.csv keeps every row.
             session_trades.clear()
-            # Per-round phase-1 state: what we already own (so we never buy
-            # both legs of the same market) and when we last attempted.
+            # Per-round holdings so we never buy both legs of the same market.
             held_tokens = set()
-            last_phase1 = 0.0
             signal_epoch = _RoundSignalEpoch()
+            trim = {"clips": 0, "last_mono": None, "last_reason": None}
             # LIVE authorizations are keyed by the known five-minute window,
             # so they can be restored before discovery. PAPER inventory is
             # keyed by condition and is refreshed immediately after discovery.
@@ -622,16 +846,13 @@ async def run_bot():
             last_status = now
             price_txt = (f"${display_price:,.2f}" if display_price is not None
                          else "waiting for price...")
-            status_band = (config.phase1_band(exact_remaining)
-                           if config.PHASE1_ENABLED else None)
-            if status_band is not None:
-                phase = (f"PHASE 1 band {status_band[2]:.2f}-{status_band[3]:.2f} "
-                         f"every {status_band[4]:.0f}s")
-            elif not config.PHASE2_ENABLED:
+            if not config.PHASE2_ENABLED:
                 phase = "idle | phase 2 parked"
             elif exact_remaining > config.TRADE_LAST_SECONDS:
                 wait_s = exact_remaining - config.TRADE_LAST_SECONDS
                 phase = f"analysis | first trade in {wait_s:.0f}s"
+            elif _in_late_trim_window(exact_remaining):
+                phase = "LATE TRIM"
             elif exact_remaining >= config.MIN_SECONDS_TO_EXPIRY:
                 phase = "TRADE WINDOW"
             else:
@@ -640,196 +861,6 @@ async def run_bot():
                 f"{_ts()} [BOT] Running | round {current_round_window_et()} | "
                 f"ends in {remain}s | {phase} | {price_txt}"
             )
-
-        # ---- phase 1: price-band entry gated by SIG PRICE -----------------
-        # The band still decides whether the selected contract is affordable;
-        # fresh Binance direction is the sole authority for the order side.
-        band = config.phase1_band(exact_remaining) if config.PHASE1_ENABLED else None
-        if (band is not None
-                and sampled_wall - last_phase1 >= band[4]):
-            last_phase1 = sampled_wall
-            _band_start, _band_end, band_lo, band_hi, band_gap = band
-            initial_price_side = price_signal(active_window, start_price, lp)
-            signal_epoch.observe(initial_price_side)
-            if initial_price_side is None:
-                print(f"{_ts()} [RISK] phase1 skip: fresh SIG PRICE is neutral or unavailable.")
-                await asyncio.sleep(0.2)
-                continue
-            # BUGFIX: charging BET_SIZE here under-counted real cash by 22%
-            # on a measured run, because the broker sizes up to the 5-share
-            # venue minimum and the fee lands on top. A cap must reserve the
-            # most the entry can cost, which is what entry_cost_ceiling gives.
-            entry_ceiling = config.entry_cost_ceiling(band_hi)
-            tokens = await asyncio.to_thread(
-                market_discovery.get_tokens_for_current_round, active_window)
-            if (not tokens or tokens.get("window_start") != active_window
-                    or tokens.get("window_end") != round_end):
-                await asyncio.sleep(0.2)
-                continue
-            up_id, down_id = tokens["up_token_id"], tokens["down_token_id"]
-
-            # A restart begins with no process-local held set. Refresh both
-            # durable risk dimensions as soon as the condition/token mapping
-            # is known, before either the cap or complement-leg gate runs.
-            round_exposure, held_tokens = _refresh_durable_round_state(
-                active_window, tokens["condition_id"],
-                round_exposure, held_tokens)
-            signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
-            if not _execution_ready(mode, tokens["condition_id"]):
-                print(f"{_ts()} [RISK] phase1 skip: private fill stream is not "
-                      "LIVE and subscribed to this market.")
-                await asyncio.sleep(0.2)
-                continue
-            if round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:
-                await asyncio.sleep(0.2)
-                continue
-
-            in_band = []
-            for candidate, token in (("UP", up_id), ("DOWN", down_id)):
-                try:
-                    _bids, asks = await asyncio.to_thread(orderbook.get_orderbook, token)
-                except Exception as exc:
-                    print(f"{_ts()} [MARKET] phase1 book read failed "
-                          f"({candidate}): {type(exc).__name__}")
-                    continue
-                if not asks:
-                    continue
-                ask = float(asks[0]["price"])
-                if band_lo <= ask <= band_hi:
-                    in_band.append((candidate, token, ask))
-
-            if not in_band:
-                await asyncio.sleep(0.2)
-                continue
-            if len(in_band) == 2:
-                # Both legs inside the band means the pair sums under $1.
-                # That is an arbitrage, not a signal, and taking one leg of it
-                # at random is not what this experiment is measuring.
-                print(f"{_ts()} [RISK] phase1 skip: both legs in band "
-                      f"({in_band[0][2]:.3f} / {in_band[1][2]:.3f}); priced as arbitrage")
-                await asyncio.sleep(0.2)
-                continue
-
-            side, token, ask = in_band[0]
-            if side != initial_price_side:
-                print(
-                    f"{_ts()} [RISK] phase1 skip: band selected {side} but "
-                    f"fresh SIG PRICE is {initial_price_side}."
-                )
-                await asyncio.sleep(0.2)
-                continue
-            other_token = down_id if side == "UP" else up_id
-            if other_token in held_tokens:
-                lock_ok, lock_detail = _pair_lock_permit(
-                    tokens["condition_id"], other_token, ask)
-                if not lock_ok:
-                    print(f"{_ts()} [RISK] phase1 skip: already hold the other "
-                          f"leg this round; {lock_detail}")
-                    await asyncio.sleep(0.2)
-                    continue
-                print(f"{_ts()} [PAIR] phase1 completing the pair: {lock_detail}")
-
-            try:
-                await asyncio.to_thread(
-                    orderbook.validate_buy_liquidity, token, config.BET_SIZE,
-                    band_hi, config.MAX_ALLOWED_SPREAD, min_price=band_lo)
-            except ValueError as exc:
-                print(f"{_ts()} [RISK] phase1 skip: {side} not buyable - {exc}.")
-                _append_trade({
-                    "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
-                    "phase": "phase1", "side": side, "amount": config.BET_SIZE,
-                    "price_side": "", "book_side": "", "chainlink_side": "",
-                    "result": "skipped_unfillable",
-                })
-                await asyncio.sleep(0.2)
-                continue
-            except Exception as exc:
-                print(f"{_ts()} [MARKET] phase1 probe failed: {type(exc).__name__}: {exc}")
-                await asyncio.sleep(0.2)
-                continue
-
-            final_lp, _final_lp_ts = price_ws.fresh_snapshot(config.BTC_STALE_AFTER)
-            final_price_side = price_signal(active_window, start_price, final_lp)
-            signal_epoch.observe(final_price_side)
-            if final_price_side is None:
-                print(f"{_ts()} [RISK] phase1 skip: SIG PRICE became neutral or stale during validation.")
-                await asyncio.sleep(0.2)
-                continue
-            if final_price_side != side:
-                print(
-                    f"{_ts()} [RISK] phase1 skip: SIG PRICE changed during validation "
-                    f"({side} -> {final_price_side})."
-                )
-                await asyncio.sleep(0.2)
-                continue
-
-            clock_ok, clock_detail, drift = await asyncio.to_thread(
-                timer.check_clock, config.CLOB_HOST, config.CLOCK_MAX_DRIFT_SECONDS)
-            if mode == "LIVE" and not clock_ok:
-                print(f"{_ts()} [RISK] phase1 skip: {clock_detail}.")
-                await asyncio.sleep(0.5)
-                continue
-
-            # Discovery and two book reads take time; re-sample the boundary
-            # immediately before submitting, exactly as the signal path does.
-            action_wall = timer.wall()
-            if (timer.window_start(action_wall) != active_window
-                    or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
-                print(f"{_ts()} [RISK] phase1 skip: round changed during validation.")
-                await asyncio.sleep(0.2)
-                continue
-            if not _execution_ready(mode, tokens["condition_id"]):
-                print(f"{_ts()} [RISK] phase1 skip: private fill stream lost "
-                      "readiness before submission.")
-                await asyncio.sleep(0.2)
-                continue
-
-            submit_lp, _submit_lp_ts = price_ws.fresh_snapshot(config.BTC_STALE_AFTER)
-            submit_price_side = price_signal(active_window, start_price, submit_lp)
-            signal_epoch.observe(submit_price_side)
-            if submit_price_side is None:
-                print(f"{_ts()} [RISK] phase1 skip: SIG PRICE is neutral or stale before submission.")
-                await asyncio.sleep(0.2)
-                continue
-            if submit_price_side != side:
-                print(
-                    f"{_ts()} [RISK] phase1 skip: SIG PRICE changed immediately before "
-                    f"submission ({side} -> {submit_price_side})."
-                )
-                await asyncio.sleep(0.2)
-                continue
-
-            verb = "Simulating live-book FOK" if mode == "PAPER" else "Placing trade"
-            print(f"{_ts()} [BOT] phase1 {verb}: {side} ${config.BET_SIZE} "
-                  f"@ ask {ask:.3f} (T-{exact_remaining:.0f}s, window "
-                  f"{_band_start}-{_band_end}s, band {band_lo:.2f}-{band_hi:.2f})")
-            # The band caps this order: without it a thin best level walks the
-            # book and fills outside the range being measured.
-            ok = await asyncio.to_thread(
-                place_trade, side, config.BET_SIZE, up_id, down_id,
-                tokens["condition_id"], round_end, band_hi,
-                pre_submit_guard=lambda: _fresh_price_permit(
-                    active_window, start_price, side,
-                    signal_observer=signal_epoch.observe))
-            if ok:
-                round_exposure += entry_ceiling
-                held_tokens.add(token)
-                signal_epoch.record_accepted(side)
-                result = ("paper_filled" if mode == "PAPER" else
-                          (polymarket_trade.last_order_status or
-                           "accepted_pending_confirmation").lower())
-            else:
-                result = "rejected_or_unsubmitted"
-                reason = polymarket_trade.last_order_error or "unknown"
-                print(f"{_ts()} [BOT] phase1 order was NOT placed - reason: {reason}")
-            _append_trade({
-                "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
-                "phase": "phase1", "side": side, "amount": config.BET_SIZE,
-                "price_side": submit_price_side, "book_side": "", "chainlink_side": "",
-                "result": result,
-            })
-            await asyncio.sleep(0.2)
-            continue
 
         if (config.SKIP_JOINED_ROUND and joined_window is not None
                 and active_window == joined_window):
@@ -844,7 +875,8 @@ async def run_bot():
 
         if (config.PHASE2_ENABLED
                 and 0 < exact_remaining <= config.TRADE_LAST_SECONDS
-                and exact_remaining >= config.MIN_SECONDS_TO_EXPIRY):
+                and exact_remaining >= config.MIN_SECONDS_TO_EXPIRY
+                and not _in_late_trim_window(exact_remaining)):
             # Keep each signal on one source: Binance start vs Binance now,
             # Chainlink 60s TWAP start vs Chainlink 60s TWAP now.  Mixing a
             # TWAP strike with a spot current value silently flips close calls.
@@ -935,7 +967,8 @@ async def run_bot():
             )
 
             price_side = price_signal(active_window, start_price, lp)
-            signal_epoch.observe(price_side)
+            if not config.SIGNAL_MINORITY_RULE:
+                signal_epoch.observe(price_side)
             signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             book_side = None
             chainlink_side = chainlink_signal(
@@ -956,7 +989,25 @@ async def run_bot():
                 continue
             # Book and Chainlink remain visible diagnostics.  They may confirm
             # SIG PRICE, but they can never override the side sent to execution.
-            side = price_side
+            #
+            # Under SIGNAL_MINORITY_RULE they DO decide it: the order follows
+            # whichever side is outvoted. The fresh-SIG-PRICE gate above still
+            # runs first, so a stale or neutral price feed refuses the round
+            # either way - only the choice of side moves, never the decision
+            # about whether it is safe to trade at all.
+            if config.SIGNAL_MINORITY_RULE:
+                side = strategy.minority_decision(
+                    price_side, book_side, chainlink_side)
+                # Track the decision, not SIG PRICE: this is what a later flip
+                # has to differ from for the complement to be permitted.
+                signal_epoch.observe(side)
+                if side is None:
+                    print(f"{_ts()} [RISK] No order: signals are tied or "
+                          f"unanimous-neutral, so there is no minority side.")
+                    await asyncio.sleep(0.2)
+                    continue
+            else:
+                side = price_side
 
             print(
                 f"{_ts()} [SIGNAL] price={price_side} book={book_side or 'n/a'} "
@@ -987,7 +1038,7 @@ async def run_bot():
 
             # Discovery, book reads and clock I/O take time. Re-sample the
             # boundary immediately before any authenticated action.
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed during validation.")
@@ -1004,7 +1055,7 @@ async def run_bot():
                     await asyncio.sleep(0.5)
                     continue
 
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed before submission.")
@@ -1034,9 +1085,10 @@ async def run_bot():
                 await _cooldown(1.0)
                 continue
             final_price_side = price_signal(active_window, start_price, final_lp)
-            signal_epoch.observe(final_price_side)
             final_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, final_cl)
+            signal_epoch.observe(_authority_side(
+                final_price_side, final_book_side, final_chainlink_side))
             _final_diagnostic_side = strategy.final_decision(
                 final_price_side, final_book_side, final_chainlink_side)
             if final_price_side is None:
@@ -1055,7 +1107,9 @@ async def run_bot():
             if other_token in held_tokens:
                 flip_allowed = False
                 flip_detail = "PAPER signal-flip mode is disabled"
-                if mode == "PAPER" and config.PAPER_ALLOW_SIGNAL_FLIPS:
+                flips_enabled = (config.PAPER_ALLOW_SIGNAL_FLIPS if mode == "PAPER"
+                                 else config.LIVE_ALLOW_SIGNAL_FLIPS)
+                if flips_enabled:
                     flip_allowed, flip_detail = signal_epoch.paper_flip_permit(side)
                 lock_ok = False
                 lock_detail = ("pair-lock is disabled"
@@ -1278,6 +1332,11 @@ async def run_bot():
             # excluded rather than charged to it.
             validation_started += time.monotonic() - extras_started
             validation_age = time.monotonic() - validation_started
+            try:
+                from dashboard import probe as _probe
+                _probe.publish_latency("validate", validation_age * 1000.0)
+            except Exception:
+                pass
             if validation_age > validation_limit:
                 print(
                     f"{_ts()} [RISK] No order: validation took {validation_age:.3f}s "
@@ -1317,7 +1376,7 @@ async def run_bot():
             book_side = submit_book_side
             chainlink_side = submit_chainlink_side
 
-            action_wall = timer.wall()
+            action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed after final validation.")
@@ -1354,9 +1413,9 @@ async def run_bot():
                     signal_observer=signal_epoch.observe))
             if ok:
                 round_exposure += entry_ceiling
-                # Shared with phase 1 and durable restart recovery. LIVE and
-                # default PAPER block the complement; the explicit PAPER
-                # experiment consults the accepted-side epoch above.
+                # Shared with durable restart recovery. LIVE and default PAPER
+                # block the complement; the explicit PAPER experiment consults
+                # the accepted-side epoch above.
                 held_tokens.add(up_id if side == "UP" else down_id)
                 signal_epoch.record_accepted(side)
                 if mode == "PAPER":
@@ -1403,6 +1462,13 @@ async def run_bot():
                 f"{config.TRADE_INTERVAL_SECONDS:g}s then continuing."
             )
             await _cooldown()
+            continue
+
+        elif _in_late_trim_window(exact_remaining):
+            round_exposure, held_tokens = await _run_late_trim(
+                mode, exact_remaining, active_window, round_end,
+                start_price, start_chainlink_price, lp,
+                round_exposure, held_tokens, signal_epoch, trim)
             continue
 
         await asyncio.sleep(0.2)

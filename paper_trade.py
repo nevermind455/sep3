@@ -57,6 +57,9 @@ class BookSnapshot:
     book_hash: str | None = None
     received_wall: float = 0.0
     best_bid: Decimal | None = None
+    # The full bid ladder, best first. An exit walks this the way an entry
+    # walks asks; `best_bid` alone cannot price anything past the top level.
+    bids: tuple[tuple[Decimal, Decimal], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,27 @@ class FillQuote:
     @property
     def total_cost(self) -> Decimal:
         return self.notional + self.fee
+
+
+@dataclass(frozen=True)
+class SellQuote:
+    """One simulated FAK exit. Unlike a FOK buy, a partial fill is a success.
+
+    An exit that insists on all-or-nothing is not an exit: the book we are
+    selling into is thin by definition - it is thin *because* the position has
+    moved against us - so refusing a partial leaves the whole position on.
+    """
+    shares: Decimal                 # shares actually sold
+    proceeds: Decimal               # gross USDC before fees
+    average_price: Decimal
+    worst_price: Decimal
+    fee: Decimal
+    levels: tuple[tuple[Decimal, Decimal, Decimal], ...]
+    unfilled: Decimal               # shares the book could not absorb
+
+    @property
+    def net_proceeds(self) -> Decimal:
+        return self.proceeds - self.fee
 
 
 class PaperRejected(RuntimeError):
@@ -152,7 +176,7 @@ def parse_book(data: dict, expected_token: str, *,
         aggregated[price] = aggregated.get(price, ZERO) + size
     asks = tuple(sorted(aggregated.items(), key=lambda level: level[0]))
 
-    bids: list[Decimal] = []
+    bid_levels: dict[Decimal, Decimal] = {}
     for raw in data.get("bids") or ():
         try:
             price = _decimal(raw.get("price") if isinstance(raw, dict) else raw[0],
@@ -163,8 +187,9 @@ def parse_book(data: dict, expected_token: str, *,
             raise PaperRejected("public order book has a malformed bid level") from exc
         if not ZERO < price < ONE or size <= ZERO:
             raise PaperRejected("public order book has an out-of-range bid level")
-        bids.append(price)
-    best_bid = max(bids) if bids else None
+        bid_levels[price] = bid_levels.get(price, ZERO) + size
+    bids = tuple(sorted(bid_levels.items(), key=lambda level: -level[0]))
+    best_bid = bids[0][0] if bids else None
     if asks and best_bid is not None and best_bid >= asks[0][0]:
         raise PaperRejected("public order book is crossed or locked")
 
@@ -190,6 +215,7 @@ def parse_book(data: dict, expected_token: str, *,
         token_id=token,
         asks=asks,
         best_bid=best_bid,
+        bids=bids,
         min_order_size=optional_decimal("min_order_size", "minimum_order_size"),
         tick_size=optional_decimal("tick_size", "minimum_tick_size"),
         timestamp=str(timestamp_ms),
@@ -254,6 +280,17 @@ def snapshot_from_book_view(view, *, expected_token: str | None = None) -> BookS
             raise PaperRejected("public order book has an out-of-range ask level")
         aggregated[price] = aggregated.get(price, ZERO) + size
     asks = tuple(sorted(aggregated.items(), key=lambda item: item[0]))
+    bid_agg: dict[Decimal, Decimal] = {}
+    for level in getattr(view, "bids", ()) or ():
+        try:
+            price = _decimal(level[0], name="bid price")
+            size = _decimal(level[1], name="bid size")
+        except (IndexError, TypeError) as exc:
+            raise PaperRejected("public order book has a malformed bid level") from exc
+        if not ZERO < price < ONE or size <= ZERO:
+            raise PaperRejected("public order book has an out-of-range bid level")
+        bid_agg[price] = bid_agg.get(price, ZERO) + size
+    bids = tuple(sorted(bid_agg.items(), key=lambda item: -item[0]))
     best_bid_raw = getattr(view, "best_bid", None)
     best_bid = (_decimal(best_bid_raw, name="bid")
                 if best_bid_raw is not None else None)
@@ -280,6 +317,7 @@ def snapshot_from_book_view(view, *, expected_token: str | None = None) -> BookS
         token_id=token,
         asks=asks,
         best_bid=best_bid,
+        bids=bids,
         tick_size=tick,
         timestamp=str(int(ts)),
         book_hash=str(digest) if digest else None,
@@ -302,6 +340,51 @@ def fetch_executable_book(token_id: str, *, host: str, ws_view=None,
             except PaperRejected:
                 pass
     return fetch_public_book(token, host=host, timeout=timeout)
+
+
+def estimate_sell_fak(book: BookSnapshot, shares, min_price,
+                      rules: MarketRules) -> SellQuote:
+    """Walk live bids downward and return what an exit would actually get.
+
+    ``min_price`` is a floor, not a target: levels below it are left alone, so
+    a stop can decline to dump into an empty book rather than accept any price
+    at all. Whatever the book cannot absorb above the floor comes back as
+    ``unfilled`` for the caller to retry or abandon.
+    """
+    wanted = _decimal(shares, name="shares")
+    floor = _decimal(min_price, name="minimum sell price")
+    if wanted <= ZERO:
+        raise PaperRejected("paper sell size must be positive")
+    if floor < ZERO or floor >= ONE:
+        raise PaperRejected("minimum sell price must be in [0, 1)")
+    if not book.bids:
+        raise PaperRejected("cannot sell: no bids on the live book")
+
+    remaining = wanted
+    sold = proceeds = total_fee = ZERO
+    used: list[tuple[Decimal, Decimal, Decimal]] = []
+    worst = ZERO
+    for price, available in book.bids:
+        if price < floor or remaining <= ZERO:
+            break
+        take = min(remaining, available)
+        if take <= ZERO:
+            continue
+        notional = take * price
+        used.append((price, take, notional))
+        sold += take
+        proceeds += notional
+        total_fee += curve_fee(take, price, rules)
+        remaining -= take
+        worst = price
+
+    if sold <= ZERO:
+        best = book.bids[0][0]
+        raise PaperRejected(
+            f"cannot sell: best bid {best} is below the floor {floor}")
+    total_fee = total_fee.quantize(FEE_PRECISION, rounding=ROUND_HALF_UP)
+    return SellQuote(sold, proceeds, proceeds / sold, worst, total_fee,
+                     tuple(used), remaining)
 
 
 def parse_market_rules(data: dict, condition_id: str, *, category: str = "crypto",
@@ -411,7 +494,12 @@ def curve_fee(shares: Decimal, price: Decimal, rules: MarketRules) -> Decimal:
 
 def size_to_venue_minimum(amount, book: BookSnapshot, rules: MarketRules,
                           max_price) -> Decimal:
-    """Raise a dollar stake just enough to buy the venue's minimum shares."""
+    """Raise a dollar stake just enough to buy the venue's minimum shares.
+
+    Best-ask * minimum is not enough: a thin top of book makes a $2.50 FOK
+    walk into 0.51 and land at 4.96 shares. Walk the same asks the fill
+    will consume.
+    """
     wanted = _decimal(amount, name="amount").quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
     if not minimums or not book.asks:
@@ -426,7 +514,19 @@ def size_to_venue_minimum(amount, book: BookSnapshot, rules: MarketRules,
     best = book.asks[0][0]
     if best > cap or best <= ZERO:
         return wanted
-    required = (minimum * best).quantize(Decimal("0.01"), rounding=ROUND_UP)
+    remaining_shares = minimum
+    notional = ZERO
+    for price, available in book.asks:
+        if price <= ZERO or price > cap:
+            break
+        take = remaining_shares if remaining_shares <= available else available
+        notional += take * price
+        remaining_shares -= take
+        if remaining_shares <= ZERO:
+            break
+    if remaining_shares > ZERO:
+        return wanted
+    required = notional.quantize(Decimal("0.01"), rounding=ROUND_UP)
     return wanted if wanted >= required else required
 
 
@@ -562,6 +662,14 @@ class PaperBroker:
             lambda cid: fetch_market_rules(cid, host=self.host, category=self.category))
         self._lock = threading.RLock()
         self._execution_lock = threading.Lock()
+        # Exits get their own lock. The execution lock exists to stop two
+        # concurrent ENTRIES becoming a duplicate order; an exit is not a
+        # duplicate entry, and sharing the lock meant a stop firing rejected
+        # that cycle's buy outright - which main_bot then followed with a full
+        # TRADE_INTERVAL_SECONDS cooldown, losing the cycle entirely. The
+        # ledger's own lock still serialises the critical section, so cash and
+        # inventory stay consistent across the two paths.
+        self._exit_lock = threading.Lock()
         # condition_id -> (MarketRules, fetched_wall). See _rules().
         self._rules_cache: dict[str, tuple] = {}
         self._rules_cache_ttl = 300.0
@@ -706,13 +814,22 @@ class PaperBroker:
             raise
 
     def cash_balance(self) -> float:
-        """Starting cash - all fill costs + payouts from resolved positions."""
+        """Starting cash - open cost + payouts + PnL already banked by selling.
+
+        Selling reduces ``position.cost`` by the basis of the shares that left,
+        which returns that basis to cash on its own. The gain or loss ON the
+        sale is not in ``cost`` at all - it lives in ``realized_from_sales`` -
+        so without this third term an exit would credit only what the shares
+        originally cost and silently discard the result of selling them.
+        """
         with self.ledger._lock:
             spent = sum(position.cost for position in self.ledger.positions.values())
             payouts = sum(
                 position.shares * float(position.payout_per_share or 0.0)
                 for position in self.ledger.positions.values() if position.settled)
-        return self.start_balance - spent + payouts
+            banked = sum(position.realized_from_sales
+                         for position in self.ledger.positions.values())
+        return self.start_balance - spent + payouts + banked
 
     def get_balance_allowance(self) -> dict:
         cash = self.cash_balance()
@@ -771,13 +888,109 @@ class PaperBroker:
                     del self._rules_cache[stale]
         return rules
 
+    def sell_shares(self, token_id: str, shares: float, *,
+                    min_price: float = 0.0,
+                    condition_id: str | None = None,
+                    window_end: float | None = None,
+                    exit_cutoff_seconds: float = 0.0) -> float:
+        """Simulate one FAK exit. Returns the shares actually sold, 0.0 if none.
+
+        Exits get their own, later cutoff than entries. The entry cutoff exists
+        to stop us BUYING into resolution; applying it to sells would trap the
+        position exactly when a stop is supposed to fire. A partial fill is a
+        success and is reported as such - the book we sell into is thin
+        precisely because the position has already moved against us.
+        """
+        if not self._exit_lock.acquire(blocking=False):
+            self.last_error = "another paper exit is already in flight"
+            return 0.0
+        try:
+            token = str(token_id or "")
+            if not token:
+                self.last_error = "missing token id"
+                return 0.0
+            try:
+                want = float(shares)
+            except (TypeError, ValueError):
+                self.last_error = "invalid sell size"
+                return 0.0
+            if not math.isfinite(want) or want <= 0:
+                self.last_error = "invalid sell size"
+                return 0.0
+            try:
+                if window_end is not None:
+                    end = float(window_end)
+                    if timer.unix() >= end - float(exit_cutoff_seconds):
+                        raise PaperRejected("exit cutoff reached")
+                context_condition, _u, _d = self._context()
+                if condition_id and str(condition_id) != context_condition:
+                    raise PaperRejected("condition does not belong to the current paper round")
+                condition_id = context_condition
+                rules = self._rules(condition_id)
+                # An exit is a taker order and eats the same delay an entry
+                # does: our own latency plus the venue matching delay. Filling
+                # against the book as it looked BEFORE that delay would make a
+                # stop appear to escape at a price it never had - the exact
+                # measurement this is being built to produce.
+                if rules.taker_delay_ms is None:
+                    raise PaperRejected(
+                        "venue matching delay is unknown; realistic paper exit "
+                        "is impossible")
+                assumed_latency_ms = self.latency_ms + rules.taker_delay_ms
+                if window_end is not None:
+                    cutoff = float(window_end) - float(exit_cutoff_seconds)
+                    if timer.unix() + assumed_latency_ms / 1000.0 >= cutoff:
+                        raise PaperRejected(
+                            "not enough time remaining for exit latency before "
+                            "the cutoff")
+                if assumed_latency_ms:
+                    time.sleep(assumed_latency_ms / 1000.0)
+                if window_end is not None and timer.unix() >= cutoff:
+                    raise PaperRejected("exit latency reached the cutoff")
+                # Re-read AFTER the delay: whatever the book did while the
+                # order was in flight is what the exit actually gets.
+                book = self._book_fetch(token)
+                if not isinstance(book, BookSnapshot):
+                    raise PaperRejected("invalid public order book response")
+                if not math.isfinite(book.received_wall) or book.received_wall <= 0:
+                    raise PaperRejected("public order book omitted receipt time")
+                if timer.wall() - book.received_wall > self.max_book_age_s:
+                    raise PaperRejected("public order book is stale in hand")
+                quote = estimate_sell_fak(book, want, min_price, rules)
+                with self._lock:
+                    held = self.ledger.positions.get(token)
+                    if held is None or held.shares + 1e-9 < float(quote.shares):
+                        raise PaperRejected("cannot sell more than the position holds")
+                    order_id = f"paper-sell-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+                    inserted = self.ledger.record_fill_durable(
+                        order_id, token, shares=float(quote.shares),
+                        price=float(quote.average_price), side="SELL",
+                        condition_id=condition_id, status="CONFIRMED",
+                        source="paper_live_book", fee=float(quote.fee))
+                    if not inserted:
+                        raise PaperRejected("paper sell was not recorded")
+                self.last_error = None
+                print(f"[PAPER] FAK sold {float(quote.shares):.6f} sh @ "
+                      f"{float(quote.average_price):.6f} | fee "
+                      f"${float(quote.fee):.5f} | unfilled "
+                      f"{float(quote.unfilled):.6f} | cash "
+                      f"${self.cash_balance():.2f}")
+                return float(quote.shares)
+            except PaperRejected as exc:
+                self.last_error = str(exc)
+                print(f"[PAPER] sell refused: {exc}")
+                return 0.0
+        finally:
+            self._exit_lock.release()
+
     def place_trade(self, side: str, amount: float,
                     up_token_id: str | None = None,
                     down_token_id: str | None = None,
                     condition_id: str | None = None,
                     window_end: float | None = None,
                     max_price: float | None = None, *,
-                    pre_submit_guard=None) -> bool:
+                    pre_submit_guard=None,
+                    min_expiry: float | None = None) -> bool:
         """Run one simulated FOK; reject concurrent duplicate submissions.
 
         `max_price` caps this order only. A caller trading a price band needs
@@ -785,13 +998,15 @@ class PaperBroker:
         a thin best level would otherwise fill outside the band being traded.
         An optional `pre_submit_guard` must return literal ``True`` after the
         modeled delay and quote, immediately before the durable paper fill.
+        `min_expiry` may lower the last-minute floor when late trim is on.
         """
         if not self._execution_lock.acquire(blocking=False):
             return self._reject(side, amount, "another paper order is already in flight")
         try:
             return self._place_trade(side, amount, up_token_id, down_token_id,
                                      condition_id, window_end, max_price,
-                                     pre_submit_guard=pre_submit_guard)
+                                     pre_submit_guard=pre_submit_guard,
+                                     min_expiry=min_expiry)
         finally:
             self._execution_lock.release()
 
@@ -801,7 +1016,8 @@ class PaperBroker:
                      condition_id: str | None = None,
                      window_end: float | None = None,
                      max_price: float | None = None, *,
-                     pre_submit_guard=None) -> bool:
+                     pre_submit_guard=None,
+                     min_expiry: float | None = None) -> bool:
         side = str(side or "").upper()
         if side not in ("UP", "DOWN"):
             return self._reject(side, amount, "invalid side")
@@ -814,8 +1030,19 @@ class PaperBroker:
                 end = float(window_end)
             except (TypeError, ValueError) as exc:
                 raise PaperRejected("missing current round end timestamp") from exc
-            now_wall = timer.wall()
-            if not end - self.trade_window_seconds <= now_wall < end - self.min_seconds_to_expiry:
+            now = timer.unix()
+            expiry_floor = self.min_seconds_to_expiry
+            if min_expiry is not None:
+                import config
+                if not config.LATE_TRIM_ENABLED:
+                    raise PaperRejected("late trim is disabled")
+                try:
+                    expiry_floor = float(min_expiry)
+                except (TypeError, ValueError) as exc:
+                    raise PaperRejected("late trim expiry floor is invalid") from exc
+                if abs(expiry_floor - config.LATE_TRIM_CUTOFF_SECONDS) > 1e-9:
+                    raise PaperRejected("late trim must use LATE_TRIM_CUTOFF_SECONDS")
+            if not end - self.trade_window_seconds <= now < end - expiry_floor:
                 raise PaperRejected("paper order is outside the current round execution interval")
             context_condition, context_up, context_down = self._context()
             if condition_id and str(condition_id) != context_condition:
@@ -831,12 +1058,12 @@ class PaperBroker:
                 raise PaperRejected(
                     "venue matching delay is unknown; realistic paper fill is impossible")
             assumed_latency_ms = self.latency_ms + rules.taker_delay_ms
-            cutoff = end - self.min_seconds_to_expiry
-            if timer.wall() + assumed_latency_ms / 1000.0 >= cutoff:
+            cutoff = end - expiry_floor
+            if timer.unix() + assumed_latency_ms / 1000.0 >= cutoff:
                 raise PaperRejected("not enough time remaining for paper latency before cutoff")
             if assumed_latency_ms:
                 time.sleep(assumed_latency_ms / 1000.0)
-            if timer.wall() >= cutoff:
+            if timer.unix() >= cutoff:
                 raise PaperRejected("paper latency reached the round cutoff")
             book = self._book_fetch(str(token_id))
             if not isinstance(book, BookSnapshot):
@@ -897,7 +1124,7 @@ class PaperBroker:
                 )
             quote = estimate_fok(book, spend, cap, rules,
                                  min_price=self.min_buy_price)
-            if timer.wall() >= end - self.min_seconds_to_expiry:
+            if timer.unix() >= cutoff:
                 raise PaperRejected("paper quote reached the round cutoff")
             with self._lock:
                 if self.cash_balance() + 1e-9 < float(quote.total_cost):
@@ -907,7 +1134,7 @@ class PaperBroker:
                 guard_error = _pre_submit_guard_error(pre_submit_guard)
                 if guard_error is not None:
                     raise PaperRejected(guard_error)
-                if timer.wall() >= end - self.min_seconds_to_expiry:
+                if timer.unix() >= cutoff:
                     raise PaperRejected("pre-submit guard reached the round cutoff")
                 order_id = f"paper-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
                 inserted = self.ledger.record_fill_durable(

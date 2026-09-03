@@ -16,9 +16,21 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Mapping
 
+from .metrics import HistSnapshot, LatencyRegistry
 from .safety import terminal_text
 
 MISSING = "--"
+
+# The submit path is instrumented in main_bot at these named stages. Adding
+# one here also adds it to snapshot() and the LATENCY panel without any
+# further wiring - `state.latency.observe("stage", ms)` starts filling it.
+LATENCY_STAGES = (
+    "validate",   # signals + book re-sample under the validation limit
+    "guard",      # pre-submit price/side re-check inside the executor
+    "network",    # FOK POST round trip until ACK
+    "total",      # end-to-end place_trade call as timed by the probe
+    "frame",      # dashboard frame render time
+)
 
 
 @dataclass
@@ -169,6 +181,10 @@ class TerminalState:
         # --- health ------------------------------------------------------
         self.loop_beat = Stamped(source="run_bot heartbeat")
         self.render_ms: Deque[float] = deque(maxlen=60)
+        # Rolling p50/p95/p99 for the submit path and the render loop. Named
+        # here rather than in main_bot so the dashboard can render any stage
+        # that gets observed, in one stable order.
+        self.latency = LatencyRegistry(LATENCY_STAGES, capacity=512)
         self.frames = 0
         self.mode = "LIVE"
         self.bet_size: float | None = None
@@ -185,6 +201,12 @@ class TerminalState:
         self.candles: Deque[Candle] = deque(maxlen=240)
         self.events: Deque[Event] = deque(maxlen=max_events)
         self.trades: list[dict] = []
+        # Exits the stop loss has taken, newest last, plus its current arming
+        # state. Kept separate from `trades` because an exit is not an entry:
+        # mixing them makes the trade table's SIDE/RESULT columns lie.
+        self.exits: list[dict] = []
+        self.stop_status: dict = {}
+        self.late_trim: dict = {}
         self.overlay: Overlay | None = None
 
         # --- notes: things this build cannot source ----------------------

@@ -213,26 +213,31 @@ def bug3_exposure_ceiling():
     src = (ROOT / "main_bot.py").read_text(encoding="utf-8")
     check("main_bot no longer charges the nominal bet",
           "round_exposure += config.BET_SIZE" not in src)
-    check("main_bot charges the ceiling at both sites",
-          src.count("round_exposure += entry_ceiling") == 2)
-    # Two charge sites (phase 1, phase 2). Phase 2 gates twice: once up front,
-    # and again immediately before submitting, because the multi-signal legs
-    # spend against the same round budget in between. The invariant that
-    # matters is that no charge site is ungated, not the raw count.
+    check("main_bot charges the ceiling at the phase-2 site",
+          src.count("round_exposure += entry_ceiling") == 1)
+    # Phase 2 gates twice: once up front, and again immediately before
+    # submitting, because the multi-signal legs spend against the same round
+    # budget in between. The invariant that matters is that no charge site is
+    # ungated, not the raw count.
     check("the gate tests the same number it later charges",
           src.count("round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE")
           >= src.count("round_exposure += entry_ceiling"))
 
-    # The default budget must still admit every entry the phases can make.
-    entries = sum(math.ceil((s - e) / max(i or config.PHASE1_INTERVAL_SECONDS, 1))
-                  for s, e, _lo, _hi, i in config.PHASE1_BANDS)
-    spent = sum(math.ceil((s - e) / max(i or config.PHASE1_INTERVAL_SECONDS, 1))
-                * config.entry_cost_ceiling(hi)
-                for s, e, _lo, hi, i in config.PHASE1_BANDS)
-    check("default cap still allows every planned entry",
-          spent <= config.MAX_ROUND_EXPOSURE + 1e-9,
-          f"{spent:.2f} > {config.MAX_ROUND_EXPOSURE:.2f}")
-    check(f"({entries} entries budgeted at ${spent:.2f})", True)
+    # The default budget must still admit every phase-2 entry.
+    if config.PHASE2_ENABLED:
+        entries = math.ceil(
+            max(0.0, config.TRADE_LAST_SECONDS - config.MIN_SECONDS_TO_EXPIRY)
+            / max(config.TRADE_INTERVAL_SECONDS, 1))
+        spent = entries * config.entry_cost_ceiling(config.MAX_BUY_PRICE)
+        check("default cap still allows every planned entry",
+              spent <= config.MAX_ROUND_EXPOSURE + 1e-9,
+              f"{spent:.2f} > {config.MAX_ROUND_EXPOSURE:.2f}")
+        check(f"({entries} entries budgeted at ${spent:.2f})", True)
+    else:
+        check("parked phase 2 still reserves at least one entry",
+              config.MAX_ROUND_EXPOSURE
+              >= config.entry_cost_ceiling(config.MAX_BUY_PRICE) - 1e-9,
+              f"{config.MAX_ROUND_EXPOSURE:.2f}")
 
 
 # ---------------------------------------------------------------- BUG 4 ----
@@ -257,11 +262,11 @@ def bug4_binance_strike():
 
 # ---------------------------------------------------------------- BUG 5 ----
 def bug5_vote_label():
-    """Phase-1 rows were reported as '0/3 backed the side taken'."""
-    print("\nBUG 5 - phase-1 fills mislabelled as trading against every signal")
+    """A row with all-blank signals was reported as '0/3 backed the side taken'."""
+    print("\nBUG 5 - abstained rows mislabelled as trading against every signal")
     src = (ROOT / "analyze_pnl.py").read_text(encoding="utf-8")
-    check("legacy blank signal columns get their own bucket",
-          "no signal recorded (legacy phase 1)" in src)
+    check("blank signal columns get their own bucket",
+          "no signal recorded" in src)
     check("the vote count is out of the signals that spoke",
           'f"{agree}/{len(live)} backed the side taken"' in src)
     check("the hard-coded /3 is gone",
@@ -272,10 +277,10 @@ def bug5_vote_label():
         live = [s for s in sides if s]
         agree = sum(1 for s in live if s == side)
         return (f"{agree}/{len(live)} backed the side taken" if live
-                else "no signal recorded (legacy phase 1)")
+                else "no signal recorded")
 
-    check("phase 1 (all blank) is not scored as disagreement",
-          bucket(["", "", ""], "UP") == "no signal recorded (legacy phase 1)")
+    check("all blank is not scored as disagreement",
+          bucket(["", "", ""], "UP") == "no signal recorded")
     check("real disagreement still reads 0/3",
           bucket(["DOWN", "DOWN", "DOWN"], "UP") == "0/3 backed the side taken")
     check("partial abstention counts only live signals",

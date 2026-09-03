@@ -109,6 +109,18 @@ class BookState:
         self._cache: dict[str, tuple[int, BookView]] = {}
         self._dirty: dict[str, int] = {}
         self.dropped_inactive = 0
+        # Silent-gap accounting. A gap is: a resync whose fresh snapshot has a
+        # different `hash` than the last state we thought we owned, or an
+        # external component telling us we drifted. Neither implies data loss
+        # in principle - deltas may have arrived between the last observation
+        # and this snapshot - but the count spiking indicates we are seeing
+        # more re-syncs than expected, and each gap event names its reason so
+        # the operator can tell an idle reconnect apart from a REST-vs-WS
+        # divergence.
+        self.gap_events: int = 0
+        self.last_gap_reason: str | None = None
+        self.last_gap_token: str | None = None
+        self.last_gap_mono: float | None = None
         self.connected = False
 
     # ------------------------------------------------------------ rotation
@@ -157,6 +169,44 @@ class BookState:
                 m["desync_reason"] = reason
                 self._dirty[t] = self._dirty.get(t, 0) + 1
 
+    def mark_gap(self, token: str, reason: str) -> bool:
+        """Public hook: mark ONE book untrustworthy because a caller detected
+        divergence (a REST cross-check disagreeing with our WS-shadow book, an
+        upstream sequence counter jumping, etc.). Returns True if the book was
+        active and previously synced (i.e. this is a real state transition).
+
+        Every caller of this method should have already made the observation
+        that justifies the desync - this function is bookkeeping, not policy.
+        """
+        token = str(token or "")
+        with self._lock:
+            meta = self._meta.get(token)
+            if meta is None or token not in self._active:
+                return False
+            was_synced = bool(meta.get("synced"))
+            meta["synced"] = False
+            meta["desync_reason"] = reason
+            self._dirty[token] = self._dirty.get(token, 0) + 1
+            self.gap_events += 1
+            self.last_gap_reason = reason
+            self.last_gap_token = token
+            self.last_gap_mono = time.monotonic()
+        return was_synced
+
+    def gap_stats(self) -> dict:
+        """Read-only diagnostic snapshot for the dashboard/tests."""
+        with self._lock:
+            return {
+                "count": self.gap_events,
+                "last_reason": self.last_gap_reason,
+                "last_token": self.last_gap_token,
+                "last_mono": self.last_gap_mono,
+                "unsynced_tokens": tuple(
+                    t for t in sorted(self._active)
+                    if not self._meta.get(t, {}).get("synced")
+                ),
+            }
+
     # -------------------------------------------------------------- writes
     def apply_snapshot(self, token: str, bids, asks, *, ts_ms=None, hash_=None,
                        tick=None, only_if_unsynced: bool = False,
@@ -185,6 +235,25 @@ class BookState:
                 return False
             if new_bids and new_asks and max(new_bids) >= min(new_asks):
                 return False
+            # Silent-gap detection: the incoming snapshot represents the venue's
+            # authoritative state at incoming_ts. If we thought we were synced,
+            # our stored hash SHOULD equal the incoming hash whenever no new
+            # deltas landed between them. previous_ts == incoming_ts is the
+            # cleanest test - same instant, so any hash difference is drift, not
+            # progress. Log it and count it; the snapshot itself is applied
+            # either way, since it is the newer authority.
+            previous_hash = m.get("hash")
+            if (m.get("synced") and hash_ and previous_hash and previous_hash != hash_
+                    and incoming_ts is not None and previous_ts is not None
+                    and incoming_ts == previous_ts):
+                self.gap_events += 1
+                self.last_gap_reason = (
+                    f"snapshot hash mismatch (had {previous_hash[:12]}, "
+                    f"got {hash_[:12]}) at ts={incoming_ts}"
+                )
+                self.last_gap_token = token
+                self.last_gap_mono = time.monotonic()
+                m["desync_reason"] = self.last_gap_reason
             self._bids[token] = new_bids
             self._asks[token] = new_asks
             m.update(synced=True, updated=time.monotonic(), ts=incoming_ts,

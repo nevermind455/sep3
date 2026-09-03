@@ -256,6 +256,7 @@ class FeedHub:
             "needs_resync": self.book.needs_resync(),
             "rest_resyncs": self.rest_resyncs,
             "prepared_round": prepared,
+            "gaps": self.book.gap_stats(),
         }
         return out
 

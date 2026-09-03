@@ -168,6 +168,10 @@ async def render_loop(state: TerminalState, stop: threading.Event, keys: Keys,
             with state.lock():
                 state.render_ms.append(ms)
                 state.frames += 1
+            try:
+                state.latency.observe("frame", ms)
+            except Exception:
+                pass
             # Self-protecting: the engine has priority. If frames get slow,
             # slow the dashboard down rather than steal loop time.
             if ms > SLOW_FRAME_MS:

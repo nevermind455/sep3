@@ -101,7 +101,9 @@ def populated() -> TerminalState:
     st.sig_price.set("UP"); st.sig_book.set("DOWN"); st.sig_chainlink.set("UP")
     st.decision.set("UP")
     st.balance.set({"balance": 41.37, "allowance": 1e6})
-    st.tokens.set({"slug": "btc-updown-5m-1754780700", "up_token_id": "72131"})
+    st.tokens.set({"slug": "btc-updown-5m-1754780700",
+                   "up_token_id": "72131", "down_token_id": "72132",
+                   "condition_id": "0xcond"})
     st.cancel.set(True)
     st.loop_beat.set(47)
     st.record_order("UP", 2.0, True, None, 640.0)
@@ -111,6 +113,46 @@ def populated() -> TerminalState:
     st.trades = [{"time_et": "Aug 09 21:04:58 ET", "side": "UP", "amount": 2.0,
                   "price_side": "UP", "book_side": "DOWN", "chainlink_side": "UP",
                   "result": "ok"}] * 12
+    st.accounting = {
+        "realized_pnl": 0.0,
+        "unrealized_mark_to_bid": 0.45,
+        "equity_pnl": 0.45,
+        "total_pnl": 0.45,
+        "pending_cost": 7.05,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": None,
+        "unmarkable_positions": 0,
+        "round_books": [{
+            "condition_id": "0xcond",
+            "legs": [
+                {"token_id": "72131", "shares": 10.0, "average_entry_price": 0.40,
+                 "cost": 4.20, "fees": 0.20, "mark_bid": 0.51,
+                 "unrealized_to_bid": 0.90},
+                {"token_id": "72132", "shares": 5.0, "average_entry_price": 0.55,
+                 "cost": 2.85, "fees": 0.10, "mark_bid": 0.48,
+                 "unrealized_to_bid": -0.45},
+            ],
+            "total_shares": 15.0,
+            "matched_shares": 5.0,
+            "leftover_shares": 5.0,
+            "leftover_token_id": "72131",
+            "leftover_cost": 2.10,
+            "leftover_pnl": 0.45,
+            "round_cost": 7.05,
+            "round_mark": 7.50,
+            "live_pnl": 0.45,
+            "pair_entry": 0.95,
+            "pair_entry_with_fees": 0.99,
+            "pair_mark": 0.99,
+            "locked_pnl": 0.05,
+            "unmarkable_legs": 0,
+        }],
+    }
+    st.late_trim = {
+        "enabled": True, "action": "buy", "reason": "trim", "side": "UP",
+        "hole": 13.54, "clips": 1, "max_clips": 2, "amount": 2.50, "ask": 0.83,
+    }
     return st
 
 
@@ -512,6 +554,69 @@ def test_round_panel_uses_official_chainlink_pair() -> None:
           "STRIKE (start px)" not in full, full)
 
 
+def test_round_book_replaces_exits_and_combines_both_legs() -> None:
+    """The old EXITS / STOP slot shows combined UP+DOWN live PnL."""
+    st = populated()
+    snap = snapshot(st, session_trades=st.trades)
+    text = "\n".join("".join(t for t, _ in row)
+                     for row in build(snap, 160, 50, UNICODE))
+    check("round book panel title is present", "ROUND BOOK / PNL" in text)
+    check("exits / stop table title is gone", "EXITS / STOP" not in text)
+    check("round panel shows up shares", "UP SHARES / COST" in text)
+    check("round panel shows down shares", "DN SHARES / COST" in text)
+    check("combined pair price is shown", "PAIR PRICE" in text or "PAIR" in text)
+    check("live pnl uses the combined mark", "LIVE PNL" in text)
+    check("live pnl value is the combined book", "+0.4500" in text, text)
+    check("matched pair lock is shown", "5.00sh" in text or "5.0sh" in text, text)
+    check("stop line remains as a compact row", "STOP" in text)
+    check("trim row is in the round book", "TRIM" in text)
+    check("hole row is in the round book", "HOLE" in text)
+    check("trim shows clip progress", "1/2 UP" in text, text)
+
+    empty = snapshot(TerminalState(), session_trades=[])
+    empty_text = "\n".join("".join(t for t, _ in row)
+                           for row in build(empty, 160, 50, UNICODE))
+    check("empty round book does not invent a live pnl dollar",
+          "$+" not in empty_text.split("LIVE PNL")[-1][:40]
+          if "LIVE PNL" in empty_text else True, empty_text)
+
+
+def test_momentum_uses_sig_price_not_a_placeholder() -> None:
+    """MOMENTUM is SIG PRICE (Binance now vs open); DIST is that split this round."""
+    st = populated()
+    st.trades = [
+        {"time_et": "Aug 26 12:00:00 ET", "side": "UP", "amount": 2.5,
+         "price_side": "UP", "book_side": "DOWN", "chainlink_side": "UP",
+         "result": "ok"},
+        {"time_et": "Aug 26 12:00:12 ET", "side": "DOWN", "amount": 2.5,
+         "price_side": "DOWN", "book_side": "DOWN", "chainlink_side": "UP",
+         "result": "ok"},
+        {"time_et": "Aug 26 12:00:24 ET", "side": "UP", "amount": 2.5,
+         "price_side": "UP", "book_side": "UP", "chainlink_side": "DOWN",
+         "result": "ok"},
+    ]
+    st.start_price.set(100.0)
+    st.push_spot(112.5)
+    st.sig_price.set("UP")
+    snap = snapshot(st, session_trades=st.trades)
+    lines = ["".join(text for text, _ in row)
+             for row in build(snap, 160, 50, UNICODE)]
+    dist = next((line for line in lines if "MOMENTUM DIST" in line), "")
+    mom_row = next((line for line in lines
+                    if "MOMENTUM" in line and "MOMENTUM DIST" not in line
+                    and "+12.50" in line), "")
+    check("momentum dist counts SIG PRICE sides this round",
+          "UP 2  DOWN 1" in dist, dist)
+    check("live momentum is SIG PRICE plus Binance move from open",
+          "UP" in mom_row and "+12.50" in mom_row, mom_row)
+    empty = snapshot(TerminalState(), session_trades=[])
+    empty_lines = ["".join(text for text, _ in row)
+                   for row in build(empty, 160, 50, UNICODE)]
+    empty_dist = next((line for line in empty_lines if "MOMENTUM DIST" in line), "")
+    check("no trades still shows the missing marker, not a fake 0/0",
+          "--" in empty_dist, empty_dist)
+
+
 def test_round_rollover_clears_old_price_and_signal_state() -> None:
     st = TerminalState()
     check("first round context is a transition",
@@ -731,7 +836,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
-    "config.py": "ac900497319827be840080c8b02c07963d0bc000d867eed06c1e362bf88c436f",
+    # Re-approved 2026-09-03: phase 1 band entry removed. See the matching
+    # note in tests_feeds.py.
+    # Re-approved 2026-09-03: optional last-minute loss trim (off by default).
+    # LATE_TRIM_* is independent of MIN_SECONDS_TO_EXPIRY so a 0 last-minute
+    # floor still loads. The 0.80-0.88 ask band is checked against MAX_BUY_PRICE
+    # only when the flag is on.
+    # Re-approved 2026-09-04: optional take-profit exit at 0.98 (off by default).
+    # Mirrors the stop loss on the winning side and refuses a fill below
+    # TAKE_PROFIT_FLOOR_PRICE; STOP_LOSS_PRICE must stay strictly below
+    # TAKE_PROFIT_PRICE when both flags are on.
+    "config.py": "711490c1481ac27ca29ca167ed0436a4918494f1e1f92b5164769d2c93627fa5",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -740,10 +855,16 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-25: PAPER may acquire the complementary outcome only
     # after a fresh, round-local SIG PRICE epoch; LIVE and ambiguous restarts
     # remain blocked, and executor commit still rechecks the selected side.
-    "main_bot.py": "08dbbec08c0d024e5a955de6167884bb8834bd9cbe0e52faf132c32c43869272",
+    # Re-approved 2026-09-03: phase 1 band entry deleted from run_bot.
+    # Re-approved 2026-09-03: submits validation-stage latency to the
+    # dashboard registry via probe.publish_latency; no trading logic changed.
+    # Re-approved 2026-09-03: optional last-minute loss trim (off by default).
+    # T-60..T-20 may place 1-2 FOKs of the red 0.80-0.88 favorite; normal
+    # entries still use MIN_SECONDS_TO_EXPIRY.
+    "main_bot.py": "4453afee041947d439a9723310111728eb1ea4f741f8b1c6e7b99c444898d693",
     # Re-approved 2026-08-25: discovery now rejects any market whose venue
     # config is not explicitly BTC / 5m / enabled 60-second TWAP.
-    "market_discovery.py": "b20c6c01d666aab8744b656449f6ed52c27feb8f72f70df417cf755e6a7dd149",
+    "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
     "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
     # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
     # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
@@ -754,10 +875,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-08-26: L2 create/derive retries CLOB read timeouts and
     # uses a 20s SDK HTTP timeout so a single slow auth round trip cannot
     # abort live USER_WS startup.
-    "polymarket_trade.py": "e565627b336aaeb0ae9ae0b24bed2d2148ba83310ea27b8834b7938d6b33a007",
+    # Re-approved 2026-09-03: buy path may lower the last-minute floor to
+    # LATE_TRIM_CUTOFF_SECONDS when late trim is on; sells keep the default.
+    # Re-approved 2026-09-04: sell path appends the full PolyApiException
+    # (status_code + body) to live_sell_errors.log so an event-feed truncation
+    # cannot hide a debuggable rejection. Sell logic itself is unchanged.
+    "polymarket_trade.py": "36de7079632b2ef804cd8671ef8d9d9ecac1b2fa9040fb2b54d51ce8cecaa2a5",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
-    "strategy.py": "95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91",
-    "timer.py": "cc99bc40b0851153d4bbcc64c48a3c740df35c157fbe0b232107ff026e404967",
+    "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
+    "timer.py": "203f04adc9e69d85fadefaefdc05ae06c4929f71138beae2e179ddd7a403718b",
 }
 
 
