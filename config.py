@@ -416,10 +416,10 @@ if not (math.isfinite(CHEAP_HEDGE_ASK_MIN)
 if not (math.isfinite(CHEAP_HEDGE_START_SECONDS)
         and math.isfinite(CHEAP_HEDGE_CUTOFF_SECONDS)
         and 0.0 <= CHEAP_HEDGE_CUTOFF_SECONDS < CHEAP_HEDGE_START_SECONDS
-        and CHEAP_HEDGE_START_SECONDS < 300.0):
+        and CHEAP_HEDGE_START_SECONDS <= 300.0):
     raise ValueError(
         "need 0 <= CHEAP_HEDGE_CUTOFF_SECONDS < "
-        "CHEAP_HEDGE_START_SECONDS < 300")
+        "CHEAP_HEDGE_START_SECONDS <= 300")
 if (not math.isfinite(CHEAP_HEDGE_MIN_HELD_COST)
         or CHEAP_HEDGE_MIN_HELD_COST < 0.0):
     raise ValueError("CHEAP_HEDGE_MIN_HELD_COST must be non-negative")

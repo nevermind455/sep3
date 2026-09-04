@@ -1548,7 +1548,9 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # MIN_HELD_COST and underdog ask is in [ASK_MIN, ASK_MAX]; sizes the buy
     # so a reversal caps loss near LOSS_CAP; guards on window, band and
     # signal agreement; no change to strategy or entry logic.
-    "config.py": "adff585d66a002dcd4cb267e7e2ea953408f7ef8d0d0ac86985907aefefa5531",
+    # Re-approved 2026-09-04: CHEAP_HEDGE_START_SECONDS guard widened to
+    # allow the full round (<= 300). Window can now be T-300..T-CUTOFF.
+    "config.py": "268bb3c39b7910d3e8559dadfcb5b4b689de7a0681f252cc3f85571cda81fe4b",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
