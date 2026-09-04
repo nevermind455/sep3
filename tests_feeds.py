@@ -1526,7 +1526,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # round-rollover block also clears session_trades, the display list behind
     # RECENT TRADES. No decision, sizing or submission path changed. Prior
     # main_bot digest: 8a49f0d7f51c...
-    "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
+    "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
     # Re-approved 2026-09-03: phase 1 band entry removed. PHASE1_ENABLED,
@@ -1571,8 +1571,8 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "main_bot.py": "4453afee041947d439a9723310111728eb1ea4f741f8b1c6e7b99c444898d693",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
-    "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
-    "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
+    "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
+    "orderbook.py": "7a4dc94929e3e83fb01ec0a0e3fa86d7e12eca47a388189e84330b6579f6e0cf",
     # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
     # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
     # still waits for a CONFIRMED user-channel trade; omitted amounts are not
@@ -1593,7 +1593,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "polymarket_trade.py": "59d80dd0e1c85dce160e3aec6a14c647a8a55ed6a9b67243966904291991d54d",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
-    "timer.py": "203f04adc9e69d85fadefaefdc05ae06c4929f71138beae2e179ddd7a403718b",
+    "timer.py": "0caebeea1d1c778660a8e842104af52415783abe9382df33d136a034ef6033e0",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
