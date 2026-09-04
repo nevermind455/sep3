@@ -23,8 +23,6 @@ import re
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
-import requests
-
 import http_pool
 import onchain_resolution
 

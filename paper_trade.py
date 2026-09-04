@@ -33,8 +33,6 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
-import requests
-
 import http_pool
 
 import timer

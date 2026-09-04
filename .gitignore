@@ -13,6 +13,7 @@ paper_account.json
 paper_ledger.json
 paper_orders.jsonl
 paper_trade_log.csv
+trade_log.csv
 *.lock
 .btc_bot_*.lock
 

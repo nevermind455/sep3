@@ -833,6 +833,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # round-rollover block also clears session_trades, the display list behind
     # RECENT TRADES. No decision, sizing or submission path changed. Prior
     # main_bot digest: 8a49f0d7f51c...
+    # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
     "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
@@ -853,7 +854,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: CHEAP_HEDGE_START_SECONDS may equal 300, so
     # the window can cover the whole round (T-300..T-CUTOFF). No trading
     # logic change - the guard was arbitrarily strict; now <= 300.
-    "config.py": "268bb3c39b7910d3e8559dadfcb5b4b689de7a0681f252cc3f85571cda81fe4b",
+    # Re-approved 2026-09-04: CHEAP_HEDGE defaults widened for single-leg
+    # coverage. ASK_MAX 0.15 -> 0.20 (band 0.10-0.20); MIN_HELD_COST 15.0
+    # -> 3.0 below one entry's cost so a single-leg round is eligible;
+    # LOSS_CAP 10.0 -> 2.5 so target_recovery stays positive at that cost.
+    # Invariant MIN_HELD_COST > LOSS_CAP is preserved; the decision module
+    # (cheap_hedge.py) is not touched.
+    "config.py": "5842b04a47ca1dbefa851853b3d29a58c29c3196f092eacfc578e16a82641f59",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -868,10 +875,14 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-03: optional last-minute loss trim (off by default).
     # T-60..T-20 may place 1-2 FOKs of the red 0.80-0.88 favorite; normal
     # entries still use MIN_SECONDS_TO_EXPIRY.
-    "main_bot.py": "4453afee041947d439a9723310111728eb1ea4f741f8b1c6e7b99c444898d693",
+    # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
+    "main_bot.py": "aa4ea3b48aba541ab14bfc9817d66406695083f2050afd67866d53c1bedc16ca",
     # Re-approved 2026-08-25: discovery now rejects any market whose venue
     # config is not explicitly BTC / 5m / enabled 60-second TWAP.
+    # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only; git
+    # diff shows no semantic change. Hash reflects Windows checkout bytes.
     "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
+    # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
     "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
     # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
     # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
@@ -892,10 +903,27 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # min(requested, actual); a dust or zero wallet skips the attempt
     # entirely. Fixes the ledger-drift hammer where phantom shares triggered
     # 'not enough balance' every poll. Entry/decision logic is unchanged.
-    "polymarket_trade.py": "59d80dd0e1c85dce160e3aec6a14c647a8a55ed6a9b67243966904291991d54d",
-    "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
-    "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
-    "timer.py": "203f04adc9e69d85fadefaefdc05ae06c4929f71138beae2e179ddd7a403718b",
+    # Re-approved 2026-09-04: removed a duplicate "taker_delay" key in the
+    # market-config return dict; the bare value already won at runtime and
+    # taker_delay is asserted isinstance(bool) upstream, so no behavior
+    # change.
+    # Re-approved 2026-09-04: removed a duplicate "taker_delay" dict key
+    # (the second-defined won and silently shadowed the first) and dropped
+    # the now-redundant bool() coercion. Kept value is what the SDK returns
+    # for that field. No decision-path change.
+    "polymarket_trade.py": "ad333edf2a51b7b10d12e619083b7819dc208ba841f702d97ff934f65d352671",
+    # Re-approved 2026-09-04: line-ending normalisation only (CRLF on
+    # disk vs LF blob after checkout). git diff shows no semantic change.
+    "price_ws.py": "c9c501942855e5448b7659dc1fac333a729cbaedbefb95a07c24fee02c13ad25",
+    # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
+    "strategy.py": "a1b90a9f78ccfd13927c95f5bb4e72f846ebb96f4c4f3a4474e029b735deb701",
+    # Re-approved 2026-09-04: removed a duplicate clock_offset() definition
+    # that silently overrode a docless twin defined earlier. Runtime
+    # unchanged - Python already used the surviving definition.
+    # Re-approved 2026-09-04: removed a duplicate clock_offset() function
+    # definition. The second, documented definition remains as the single
+    # source of truth. No behaviour change - both definitions were identical.
+    "timer.py": "aa13db9172a751f0f52f6d9cb17853dfb9fdec07488988609369c490782f39b9",
 }
 
 
@@ -1001,6 +1029,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         "observer": trade._order_observer,
         "journal_fault": trade._journal_fault,
         "trade_window": trade.config.TRADE_LAST_SECONDS,
+        "exec_window": trade.config.EXECUTION_WINDOW_SECONDS,
         "min_expiry": trade.config.MIN_SECONDS_TO_EXPIRY,
         "ambiguous_condition": trade._ambiguous_condition,
         "ambiguous_until": trade._ambiguous_until,
@@ -1045,6 +1074,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         [{"price": "0.49", "size": "100"}],
         [{"price": "0.50", "size": "100"}])
     trade.config.TRADE_LAST_SECONDS = 300
+    trade.config.EXECUTION_WINDOW_SECONDS = 300
     trade.config.MIN_SECONDS_TO_EXPIRY = 0
     trade.set_order_observer(lambda _receipt: True)
     try:
@@ -1269,6 +1299,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         trade.set_order_observer(originals["observer"])
         trade._journal_fault = originals["journal_fault"]
         trade.config.TRADE_LAST_SECONDS = originals["trade_window"]
+        trade.config.EXECUTION_WINDOW_SECONDS = originals["exec_window"]
         trade.config.MIN_SECONDS_TO_EXPIRY = originals["min_expiry"]
         trade._ambiguous_condition = originals["ambiguous_condition"]
         trade._ambiguous_until = originals["ambiguous_until"]

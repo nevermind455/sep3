@@ -19,11 +19,6 @@ _clock_sample_wall = None
 _clock_sample_mono = None
 
 
-def clock_offset() -> float:
-    with _clock_lock:
-        return _clock_offset
-
-
 def clock_measured() -> bool:
     with _clock_lock:
         return _clock_measured

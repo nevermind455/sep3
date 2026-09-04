@@ -385,24 +385,26 @@ if (STOP_LOSS_ENABLED and TAKE_PROFIT_ENABLED
     raise ValueError(
         "STOP_LOSS_PRICE must stay below TAKE_PROFIT_PRICE when both are on")
 
-# ---- cheap hedge (reversal insurance on a large position) ------------------
-# Buys the UNDERDOG (0.10-0.15 band) ONCE per round when the held side has
+# ---- cheap hedge (reversal insurance) --------------------------------------
+# Buys the UNDERDOG (0.10-0.20 band) ONCE per round when the held side has
 # accumulated at least MIN_HELD_COST. Sizes the hedge so, if the round
 # reverses and the underdog wins, total round loss is capped near LOSS_CAP.
-# Never insures a small position: on <MIN_HELD_COST the premium eats too
-# much of the win.
+# Defaults let the hedge fire on a single-leg round: MIN_HELD_COST=3.0 sits
+# below one entry's cost (5 shares * MAX_BUY_PRICE + fee ~= $4.82) and
+# LOSS_CAP=2.5 sits below it too, so target_recovery is positive and the
+# hedge actually clears its own eligibility check.
 #
 # Independent of LATE_TRIM. That module fires later (T-60..T-20), buys the
 # FAVORITE (0.80-0.88), closes a hole that already exists. This module fires
-# earlier (T-180..T-60), buys the UNDERDOG (0.10-0.15), pays a small premium
+# earlier (T-180..T-60), buys the UNDERDOG (0.10-0.20), pays a small premium
 # for a large payout on reversal.
 CHEAP_HEDGE_ENABLED = bool(_env_bool("CHEAP_HEDGE_ENABLED", False))
-CHEAP_HEDGE_MIN_HELD_COST = _env_float("CHEAP_HEDGE_MIN_HELD_COST", "15.0")
+CHEAP_HEDGE_MIN_HELD_COST = _env_float("CHEAP_HEDGE_MIN_HELD_COST", "3.0")
 CHEAP_HEDGE_ASK_MIN = _env_float("CHEAP_HEDGE_ASK_MIN", "0.10")
-CHEAP_HEDGE_ASK_MAX = _env_float("CHEAP_HEDGE_ASK_MAX", "0.15")
+CHEAP_HEDGE_ASK_MAX = _env_float("CHEAP_HEDGE_ASK_MAX", "0.20")
 CHEAP_HEDGE_START_SECONDS = _env_float("CHEAP_HEDGE_START_SECONDS", "180")
 CHEAP_HEDGE_CUTOFF_SECONDS = _env_float("CHEAP_HEDGE_CUTOFF_SECONDS", "60")
-CHEAP_HEDGE_LOSS_CAP = _env_float("CHEAP_HEDGE_LOSS_CAP", "10.0")
+CHEAP_HEDGE_LOSS_CAP = _env_float("CHEAP_HEDGE_LOSS_CAP", "2.5")
 CHEAP_HEDGE_MAX_HEDGE_COST = _env_float("CHEAP_HEDGE_MAX_HEDGE_COST", "3.5")
 CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL = bool(_env_bool(
     "CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL", True))
