@@ -660,6 +660,10 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         tasks.append(asyncio.create_task(
             _take_profit_loop(hub, exit_broker, ledger, stop, on_event),
             name="takeprofit"))
+    if config.CHEAP_HEDGE_ENABLED:
+        tasks.append(asyncio.create_task(
+            _cheap_hedge_loop(hub, ledger, stop, on_event),
+            name="cheaphedge"))
     tasks.append(asyncio.create_task(
         adapters.agreement_sampler(hub, cfg, agreement, stop, on_event), name="audit"))
     tasks.append(strike.start())
@@ -1026,6 +1030,156 @@ async def _take_profit_loop(hub, broker, ledger, stop, on_event) -> None:
         except Exception as exc:
             on_event("takeprofit", f"{type(exc).__name__}: {exc}", "warn")
         await asyncio.sleep(config.TAKE_PROFIT_POLL_SECONDS)
+
+
+async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
+    """Once per round, insure a large one-sided position with a cheap
+    underdog buy. Fires at most once per (window, condition); guarded by
+    inventory size, underdog price band, remaining time and signal
+    agreement per cheap_hedge.evaluate_cheap_hedge().
+
+    On its own task rather than inside the strategy loop for the same reason
+    the stop-loss and take-profit loops are: the entry pipeline is expensive
+    (discovery, clock check, book reads) and this trigger needs none of
+    that. Sharing that pipeline would mean the hedge could only fire as
+    often as the bot decides to enter, which is exactly the wrong cadence
+    for insurance.
+    """
+    import cheap_hedge
+    import config
+    import main_bot
+    import timer
+    fired: set[tuple[int, str]] = set()   # (window, condition_id)
+    fail_streak: dict[tuple[int, str], int] = {}
+    backoff_until: dict[tuple[int, str], float] = {}
+    while not stop.is_set():
+        try:
+            sampled = timer.unix()
+            window = timer.window_start(sampled)
+            remaining = (window + 300) - sampled
+            condition = hub.condition_id
+            if not condition or hub.up_token is None or hub.down_token is None:
+                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
+                continue
+            key = (window, str(condition))
+            if key in fired:
+                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
+                continue
+            if time.monotonic() < backoff_until.get(key, 0.0):
+                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
+                continue
+
+            # Inventory per token for THIS round's condition.
+            up_shares = up_cost = 0.0
+            down_shares = down_cost = 0.0
+            up_token = str(hub.up_token)
+            down_token = str(hub.down_token)
+            with ledger._lock:
+                for tid, pos in ledger.positions.items():
+                    if pos.settled or pos.condition_id != condition:
+                        continue
+                    tid_s = str(tid)
+                    if tid_s == up_token:
+                        up_shares += float(pos.shares or 0.0)
+                        up_cost += float(pos.cost or 0.0) + float(pos.fees or 0.0)
+                    elif tid_s == down_token:
+                        down_shares += float(pos.shares or 0.0)
+                        down_cost += float(pos.cost or 0.0) + float(pos.fees or 0.0)
+
+            up_view = hub.book.view(up_token)
+            down_view = hub.book.view(down_token)
+            up_ask = getattr(up_view, "best_ask", None) if up_view else None
+            down_ask = getattr(down_view, "best_ask", None) if down_view else None
+
+            # Signals as of NOW; pull from the same telemetry the dashboard
+            # reads, sourced from the strategy loop's own probes.
+            probe_state = None
+            try:
+                from dashboard import probe as _probe
+                probe_state = _probe._sink.state if _probe._sink else None
+            except Exception:
+                probe_state = None
+            def _sig(field: str) -> str | None:
+                if probe_state is None:
+                    return None
+                try:
+                    stamped = getattr(probe_state, field, None)
+                    v = stamped.value if stamped is not None else None
+                    return v if v in ("UP", "DOWN") else None
+                except Exception:
+                    return None
+
+            decision = cheap_hedge.evaluate_cheap_hedge(
+                enabled=config.CHEAP_HEDGE_ENABLED,
+                remaining=remaining,
+                start=config.CHEAP_HEDGE_START_SECONDS,
+                cutoff=config.CHEAP_HEDGE_CUTOFF_SECONDS,
+                up_shares=up_shares, up_cost=up_cost,
+                down_shares=down_shares, down_cost=down_cost,
+                up_ask=up_ask, down_ask=down_ask,
+                ask_min=config.CHEAP_HEDGE_ASK_MIN,
+                ask_max=config.CHEAP_HEDGE_ASK_MAX,
+                min_held_cost=config.CHEAP_HEDGE_MIN_HELD_COST,
+                loss_cap=config.CHEAP_HEDGE_LOSS_CAP,
+                max_hedge_cost=config.CHEAP_HEDGE_MAX_HEDGE_COST,
+                price_side=_sig("sig_price"),
+                book_side=_sig("sig_book"),
+                chainlink_side=_sig("sig_chainlink"),
+                require_strong_signal=config.CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL,
+                already_hedged=False,   # dedupe by `fired` set above
+            )
+
+            if decision["action"] != "buy":
+                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
+                continue
+
+            side = decision["side"]
+            amount = float(decision["amount"] or 0.0)
+            max_price = float(decision["max_price"] or config.CHEAP_HEDGE_ASK_MAX)
+            on_event("cheaphedge",
+                     f"{side} ${amount:.2f} @<={max_price:.2f} "
+                     f"(held {decision['held_side']} ${decision['held_cost']:.2f}, "
+                     f"underdog ask {decision['ask']:.3f}, "
+                     f"target loss cap ${config.CHEAP_HEDGE_LOSS_CAP:.2f})",
+                     "warn")
+            # place_trade is the same entry the strategy loop uses; patched
+            # for paper by install_paper_execution, real for live. It handles
+            # its own preflight, guard and back-off.
+            ok = await asyncio.to_thread(
+                main_bot.place_trade, side, amount, up_token, down_token,
+                condition, window + 300, max_price)
+            if ok:
+                fired.add(key)
+                fail_streak.pop(key, None)
+                backoff_until.pop(key, None)
+                on_event("cheaphedge",
+                         f"hedge {side} filled: ${amount:.2f} "
+                         f"({decision.get('shares', 0.0):.2f} shares @ "
+                         f"~{decision['ask']:.3f})", "good")
+            else:
+                streak = fail_streak.get(key, 0) + 1
+                fail_streak[key] = streak
+                on_event("cheaphedge",
+                         f"hedge not placed ({streak}x): "
+                         f"{main_bot.polymarket_trade.last_order_error or 'unknown'}",
+                         "warn")
+                # Back off the same way the sell loops do. A repeatedly
+                # failing hedge is either an ineligible book or an auth
+                # issue; either way, hammering will not fix it.
+                if streak >= _EXIT_MAX_FAILS_BEFORE_BACKOFF:
+                    backoff_until[key] = time.monotonic() + _EXIT_BACKOFF_SECONDS
+                    on_event("cheaphedge",
+                             f"backing off {_EXIT_BACKOFF_SECONDS:.0f}s "
+                             f"after {streak} consecutive failures", "bad")
+
+            # Prune stale per-round bookkeeping at rollover, exactly like
+            # the take-profit loop does.
+            fired = {k for k in fired if k[0] == window}
+            fail_streak = {k: v for k, v in fail_streak.items() if k[0] == window}
+            backoff_until = {k: v for k, v in backoff_until.items() if k[0] == window}
+        except Exception as exc:
+            on_event("cheaphedge", f"{type(exc).__name__}: {exc}", "warn")
+        await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
 
 
 async def _rotation_loop(hub, stop) -> None:

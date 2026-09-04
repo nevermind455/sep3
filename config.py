@@ -385,6 +385,59 @@ if (STOP_LOSS_ENABLED and TAKE_PROFIT_ENABLED
     raise ValueError(
         "STOP_LOSS_PRICE must stay below TAKE_PROFIT_PRICE when both are on")
 
+# ---- cheap hedge (reversal insurance on a large position) ------------------
+# Buys the UNDERDOG (0.10-0.15 band) ONCE per round when the held side has
+# accumulated at least MIN_HELD_COST. Sizes the hedge so, if the round
+# reverses and the underdog wins, total round loss is capped near LOSS_CAP.
+# Never insures a small position: on <MIN_HELD_COST the premium eats too
+# much of the win.
+#
+# Independent of LATE_TRIM. That module fires later (T-60..T-20), buys the
+# FAVORITE (0.80-0.88), closes a hole that already exists. This module fires
+# earlier (T-180..T-60), buys the UNDERDOG (0.10-0.15), pays a small premium
+# for a large payout on reversal.
+CHEAP_HEDGE_ENABLED = bool(_env_bool("CHEAP_HEDGE_ENABLED", False))
+CHEAP_HEDGE_MIN_HELD_COST = _env_float("CHEAP_HEDGE_MIN_HELD_COST", "15.0")
+CHEAP_HEDGE_ASK_MIN = _env_float("CHEAP_HEDGE_ASK_MIN", "0.10")
+CHEAP_HEDGE_ASK_MAX = _env_float("CHEAP_HEDGE_ASK_MAX", "0.15")
+CHEAP_HEDGE_START_SECONDS = _env_float("CHEAP_HEDGE_START_SECONDS", "180")
+CHEAP_HEDGE_CUTOFF_SECONDS = _env_float("CHEAP_HEDGE_CUTOFF_SECONDS", "60")
+CHEAP_HEDGE_LOSS_CAP = _env_float("CHEAP_HEDGE_LOSS_CAP", "10.0")
+CHEAP_HEDGE_MAX_HEDGE_COST = _env_float("CHEAP_HEDGE_MAX_HEDGE_COST", "3.5")
+CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL = bool(_env_bool(
+    "CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL", True))
+CHEAP_HEDGE_POLL_SECONDS = _env_float("CHEAP_HEDGE_POLL_SECONDS", "1.0")
+
+if not (math.isfinite(CHEAP_HEDGE_ASK_MIN)
+        and math.isfinite(CHEAP_HEDGE_ASK_MAX)
+        and 0.0 < CHEAP_HEDGE_ASK_MIN < CHEAP_HEDGE_ASK_MAX < 1.0):
+    raise ValueError(
+        "CHEAP_HEDGE_ASK_MIN must be below CHEAP_HEDGE_ASK_MAX in (0, 1)")
+if not (math.isfinite(CHEAP_HEDGE_START_SECONDS)
+        and math.isfinite(CHEAP_HEDGE_CUTOFF_SECONDS)
+        and 0.0 <= CHEAP_HEDGE_CUTOFF_SECONDS < CHEAP_HEDGE_START_SECONDS
+        and CHEAP_HEDGE_START_SECONDS < 300.0):
+    raise ValueError(
+        "need 0 <= CHEAP_HEDGE_CUTOFF_SECONDS < "
+        "CHEAP_HEDGE_START_SECONDS < 300")
+if (not math.isfinite(CHEAP_HEDGE_MIN_HELD_COST)
+        or CHEAP_HEDGE_MIN_HELD_COST < 0.0):
+    raise ValueError("CHEAP_HEDGE_MIN_HELD_COST must be non-negative")
+if not math.isfinite(CHEAP_HEDGE_LOSS_CAP) or CHEAP_HEDGE_LOSS_CAP < 0.0:
+    raise ValueError("CHEAP_HEDGE_LOSS_CAP must be non-negative")
+if (not math.isfinite(CHEAP_HEDGE_MAX_HEDGE_COST)
+        or CHEAP_HEDGE_MAX_HEDGE_COST <= 0.0):
+    raise ValueError("CHEAP_HEDGE_MAX_HEDGE_COST must be positive")
+if not 0.2 <= CHEAP_HEDGE_POLL_SECONDS <= 30.0:
+    raise ValueError("CHEAP_HEDGE_POLL_SECONDS must be between 0.2 and 30")
+# The hedge buy caps its own limit at CHEAP_HEDGE_ASK_MAX, and the entry
+# path elsewhere caps at MAX_BUY_PRICE. Both are enforced on the venue side,
+# so a max above MAX_BUY_PRICE would silently be re-capped - warn instead.
+if CHEAP_HEDGE_ENABLED and CHEAP_HEDGE_ASK_MAX > MAX_BUY_PRICE:
+    raise ValueError(
+        "CHEAP_HEDGE_ASK_MAX cannot exceed MAX_BUY_PRICE; raise "
+        "MAX_BUY_PRICE or lower CHEAP_HEDGE_ASK_MAX before enabling")
+
 CANCEL_OPEN_BEFORE_TRADE = bool(_env_bool("CANCEL_OPEN_BEFORE_TRADE", False))
 ALLOW_GLOBAL_CANCEL_ALL = bool(_env_bool("ALLOW_GLOBAL_CANCEL_ALL", False))
 ALLOW_CUSTOM_CLOB_HOST = bool(_env_bool("ALLOW_CUSTOM_CLOB_HOST", False))

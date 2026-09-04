@@ -846,7 +846,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Mirrors the stop loss on the winning side and refuses a fill below
     # TAKE_PROFIT_FLOOR_PRICE; STOP_LOSS_PRICE must stay strictly below
     # TAKE_PROFIT_PRICE when both flags are on.
-    "config.py": "711490c1481ac27ca29ca167ed0436a4918494f1e1f92b5164769d2c93627fa5",
+    # Re-approved 2026-09-04: optional cheap-hedge reversal insurance (off
+    # by default). CHEAP_HEDGE_* buys the underdog once per round when the
+    # held-side cost >= MIN_HELD_COST and its ask is in [ASK_MIN, ASK_MAX];
+    # sizes toward LOSS_CAP and refuses if a signal has already flipped.
+    "config.py": "adff585d66a002dcd4cb267e7e2ea953408f7ef8d0d0ac86985907aefefa5531",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
