@@ -1550,7 +1550,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # signal agreement; no change to strategy or entry logic.
     # Re-approved 2026-09-04: CHEAP_HEDGE_START_SECONDS guard widened to
     # allow the full round (<= 300). Window can now be T-300..T-CUTOFF.
-    "config.py": "268bb3c39b7910d3e8559dadfcb5b4b689de7a0681f252cc3f85571cda81fe4b",
+    # Re-approved 2026-09-04: CHEAP_HEDGE defaults widened for single-leg
+    # coverage. ASK_MAX 0.15 -> 0.20 (band is now 0.10-0.20 as intended);
+    # MIN_HELD_COST 15.0 -> 3.0 sits below one entry's cost so a single-leg
+    # round is eligible; LOSS_CAP 10.0 -> 2.5 keeps target_recovery positive
+    # at typical single-leg cost (invariant MIN_HELD_COST > LOSS_CAP still
+    # holds). Every guard (ASK_MIN < ASK_MAX < 1.0, ASK_MAX <= MAX_BUY_PRICE,
+    # MIN_HELD_COST >= 0, LOSS_CAP >= 0, MAX_HEDGE_COST > 0) is unchanged;
+    # decision code in cheap_hedge.py is untouched.
+    "config.py": "17c26678387834ee57b2e2d022e01569665dd7d5ac0d1f22d1c719cad12f71c8",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
