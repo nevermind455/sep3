@@ -898,10 +898,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # min(requested, actual); a dust or zero wallet skips the attempt
     # entirely. Fixes the ledger-drift hammer where phantom shares triggered
     # 'not enough balance' every poll. Entry/decision logic is unchanged.
-    "polymarket_trade.py": "59d80dd0e1c85dce160e3aec6a14c647a8a55ed6a9b67243966904291991d54d",
+    # Re-approved 2026-09-04: removed a duplicate "taker_delay" key in the
+    # market-config return dict; the bare value already won at runtime and
+    # taker_delay is asserted isinstance(bool) upstream, so no behavior
+    # change.
+    "polymarket_trade.py": "cbbd36d22508e5a020ced5a3bf302c00e34a27b244470918977e1ba91a6cd1d6",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
-    "timer.py": "0caebeea1d1c778660a8e842104af52415783abe9382df33d136a034ef6033e0",
+    # Re-approved 2026-09-04: removed a duplicate clock_offset() definition
+    # that silently overrode a docless twin defined earlier. Runtime
+    # unchanged - Python already used the surviving definition.
+    "timer.py": "8c382dbd962ffa3f14e35fc3b35d9a4720dd8463e35bcce62d2b1fdbdfd946ce",
 }
 
 

@@ -55,8 +55,6 @@ def evaluate_cheap_hedge(
     exception, so a caller in the hot exit path can act on the return value
     without a try/except.
     """
-    up_sh = _finite(up_shares) or 0.0
-    down_sh = _finite(down_shares) or 0.0
     up_c = _finite(up_cost) or 0.0
     down_c = _finite(down_cost) or 0.0
 

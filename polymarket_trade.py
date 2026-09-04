@@ -579,13 +579,12 @@ def _validate_market_mapping(info, condition_id, up_token_id, down_token_id):
         while len(_market_fee_by_token) > _MAX_FEE_CACHE_TOKENS:
             _market_fee_by_token.pop(next(iter(_market_fee_by_token)))
     return {
-        "taker_delay": bool(taker_delay),
+        "taker_delay": taker_delay,
         "minimum": minimum,
         "tick": tick,
         "neg_risk": neg_risk,
         "fee_rate": fee_rate,
         "fee_exponent": fee_exponent,
-        "taker_delay": taker_delay,
     }
 
 

@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Mapping
 
-from .metrics import HistSnapshot, LatencyRegistry
+from .metrics import LatencyRegistry
 from .safety import terminal_text
 
 MISSING = "--"

@@ -1598,10 +1598,20 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: sell path queries the wallet's actual on-chain
     # share balance and caps the FAK at min(requested, actual); a dust or
     # zero wallet skips the attempt. Fixes the ledger-drift hammer.
-    "polymarket_trade.py": "59d80dd0e1c85dce160e3aec6a14c647a8a55ed6a9b67243966904291991d54d",
+    # Re-approved 2026-09-04: dead code cleanup. The market-config return dict
+    # had "taker_delay" listed twice (once wrapped in bool(), once bare); the
+    # bare one silently overwrote the wrapped one because taker_delay is
+    # already asserted isinstance(bool) a few lines earlier. Removed the
+    # redundant duplicate. No behavior change: both branches produced the
+    # same bool value.
+    "polymarket_trade.py": "cbbd36d22508e5a020ced5a3bf302c00e34a27b244470918977e1ba91a6cd1d6",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
-    "timer.py": "0caebeea1d1c778660a8e842104af52415783abe9382df33d136a034ef6033e0",
+    # Re-approved 2026-09-04: removed a duplicate clock_offset() definition
+    # that silently overrode a docless twin defined earlier in the module.
+    # Kept the version with the docstring; runtime behaviour is unchanged
+    # because Python was already using the later definition.
+    "timer.py": "8c382dbd962ffa3f14e35fc3b35d9a4720dd8463e35bcce62d2b1fdbdfd946ce",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
