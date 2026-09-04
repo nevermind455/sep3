@@ -1007,6 +1007,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         "observer": trade._order_observer,
         "journal_fault": trade._journal_fault,
         "trade_window": trade.config.TRADE_LAST_SECONDS,
+        "exec_window": trade.config.EXECUTION_WINDOW_SECONDS,
         "min_expiry": trade.config.MIN_SECONDS_TO_EXPIRY,
         "ambiguous_condition": trade._ambiguous_condition,
         "ambiguous_until": trade._ambiguous_until,
@@ -1051,6 +1052,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         [{"price": "0.49", "size": "100"}],
         [{"price": "0.50", "size": "100"}])
     trade.config.TRADE_LAST_SECONDS = 300
+    trade.config.EXECUTION_WINDOW_SECONDS = 300
     trade.config.MIN_SECONDS_TO_EXPIRY = 0
     trade.set_order_observer(lambda _receipt: True)
     try:
@@ -1275,6 +1277,7 @@ def test_order_response_requires_acceptance_evidence() -> None:
         trade.set_order_observer(originals["observer"])
         trade._journal_fault = originals["journal_fault"]
         trade.config.TRADE_LAST_SECONDS = originals["trade_window"]
+        trade.config.EXECUTION_WINDOW_SECONDS = originals["exec_window"]
         trade.config.MIN_SECONDS_TO_EXPIRY = originals["min_expiry"]
         trade._ambiguous_condition = originals["ambiguous_condition"]
         trade._ambiguous_until = originals["ambiguous_until"]
