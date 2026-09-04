@@ -37,9 +37,7 @@ BASE = dict(
     min_held_cost=15.0,
     loss_cap=10.0,
     max_hedge_cost=3.50,
-    price_side="DOWN",
-    book_side="DOWN",
-    chainlink_side="DOWN",
+    current_traded_side="DOWN",           # strategy still trading held side
     require_strong_signal=True,
     already_hedged=False,
 )
@@ -126,27 +124,44 @@ def t_underdog_ask_out_of_band_high():
           str(d))
 
 
-def t_signal_flipped_refuses():
-    # Held side is DOWN. price_side has already flipped to UP.
-    d = evaluate_cheap_hedge(**{**BASE, "price_side": "UP"})
-    check("price signal flip refuses",
-          d["action"] == "skip" and "SIG_PRICE=UP" in d["reason"],
+def t_current_traded_side_flipped_refuses():
+    # Held DOWN, but the strategy is currently trading UP - reversal in
+    # progress, no hedge.
+    d = evaluate_cheap_hedge(**{**BASE, "current_traded_side": "UP"})
+    check("current traded side flip refuses",
+          d["action"] == "skip"
+          and "strategy currently trading UP" in d["reason"],
           str(d))
 
 
-def t_signal_neutral_does_not_refuse():
-    # A neutral (None) signal is not a disagreement; it just did not vote.
-    d = evaluate_cheap_hedge(**{**BASE, "price_side": None})
-    check("neutral signal does not block",
+def t_current_traded_side_none_does_not_refuse():
+    # A None current side is not a flip - just unknown. Hedge should not
+    # be blocked on unknown; the caller passes None before the first
+    # phase-2 evaluation of the round.
+    d = evaluate_cheap_hedge(**{**BASE, "current_traded_side": None})
+    check("None current side does not block",
           d["action"] == "buy", str(d))
 
 
 def t_require_strong_signal_disabled_ignores_flip():
     d = evaluate_cheap_hedge(**{
-        **BASE, "require_strong_signal": False, "price_side": "UP"
+        **BASE, "require_strong_signal": False, "current_traded_side": "UP"
     })
-    check("with require_strong_signal off, a flipped signal is ignored",
+    check("with require_strong_signal off, a flipped current side is ignored",
           d["action"] == "buy", str(d))
+
+
+def t_minority_rule_scenario_now_permits_hedge():
+    # This is the exact case that used to fail. With minority rule ON, the
+    # bot builds a DOWN position while SIG_PRICE stays UP (majority). Now
+    # we check the ACTUAL traded side, not SIG_PRICE, so the hedge fires.
+    # current_traded_side matches held_side because that is what the bot
+    # picked via minority_decision.
+    d = evaluate_cheap_hedge(**{
+        **BASE, "current_traded_side": "DOWN",     # bot picked DOWN
+    })
+    check("under minority rule, hedge fires when current side matches held",
+          d["action"] == "buy" and d["side"] == "UP", str(d))
 
 
 def t_held_cost_already_within_cap():
@@ -185,7 +200,7 @@ def t_side_selection_flips_when_up_is_the_held_side():
         "up_shares": 40.0, "up_cost": 24.0,
         "down_shares": 0.0, "down_cost": 0.0,
         "up_ask": 0.85, "down_ask": 0.12,  # DOWN is now the cheap underdog
-        "price_side": "UP", "book_side": "UP", "chainlink_side": "UP",
+        "current_traded_side": "UP",       # strategy still buying UP
     })
     check("hedges the OTHER side (DOWN) when UP is held",
           d["action"] == "buy" and d["side"] == "DOWN", str(d))

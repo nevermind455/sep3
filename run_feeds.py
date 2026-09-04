@@ -1052,6 +1052,8 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
     fired: set[tuple[int, str]] = set()   # (window, condition_id)
     fail_streak: dict[tuple[int, str], int] = {}
     backoff_until: dict[tuple[int, str], float] = {}
+    last_heartbeat_mono = 0.0
+    HEARTBEAT_EVERY_S = 60.0
     while not stop.is_set():
         try:
             sampled = timer.unix()
@@ -1059,15 +1061,16 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
             remaining = (window + 300) - sampled
             condition = hub.condition_id
             if not condition or hub.up_token is None or hub.down_token is None:
+                # No round yet - do not log heartbeat here or restart will
+                # print a status before the first strategy loop even runs.
                 await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
                 continue
             key = (window, str(condition))
+            skip_reason = None
             if key in fired:
-                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
-                continue
-            if time.monotonic() < backoff_until.get(key, 0.0):
-                await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
-                continue
+                skip_reason = "already hedged this round"
+            elif time.monotonic() < backoff_until.get(key, 0.0):
+                skip_reason = "in back-off after repeated failures"
 
             # Inventory per token for THIS round's condition.
             up_shares = up_cost = 0.0
@@ -1091,23 +1094,23 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
             up_ask = getattr(up_view, "best_ask", None) if up_view else None
             down_ask = getattr(down_view, "best_ask", None) if down_view else None
 
-            # Signals as of NOW; pull from the same telemetry the dashboard
-            # reads, sourced from the strategy loop's own probes.
-            probe_state = None
+            # The direction the strategy is currently trading. Sourced from
+            # state.decision, which the probe now updates from BOTH
+            # strategy.final_decision AND strategy.minority_decision so
+            # SIGNAL_MINORITY_RULE reflects the true traded side (fixing
+            # the earlier "any signal disagrees" bug that refused every
+            # legit hedge under minority rule).
+            current_traded_side = None
             try:
                 from dashboard import probe as _probe
                 probe_state = _probe._sink.state if _probe._sink else None
-            except Exception:
-                probe_state = None
-            def _sig(field: str) -> str | None:
-                if probe_state is None:
-                    return None
-                try:
-                    stamped = getattr(probe_state, field, None)
+                if probe_state is not None:
+                    stamped = getattr(probe_state, "decision", None)
                     v = stamped.value if stamped is not None else None
-                    return v if v in ("UP", "DOWN") else None
-                except Exception:
-                    return None
+                    if v in ("UP", "DOWN"):
+                        current_traded_side = v
+            except Exception:
+                current_traded_side = None
 
             decision = cheap_hedge.evaluate_cheap_hedge(
                 enabled=config.CHEAP_HEDGE_ENABLED,
@@ -1122,14 +1125,39 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
                 min_held_cost=config.CHEAP_HEDGE_MIN_HELD_COST,
                 loss_cap=config.CHEAP_HEDGE_LOSS_CAP,
                 max_hedge_cost=config.CHEAP_HEDGE_MAX_HEDGE_COST,
-                price_side=_sig("sig_price"),
-                book_side=_sig("sig_book"),
-                chainlink_side=_sig("sig_chainlink"),
+                current_traded_side=current_traded_side,
                 require_strong_signal=config.CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL,
-                already_hedged=False,   # dedupe by `fired` set above
+                already_hedged=bool(skip_reason),
             )
 
-            if decision["action"] != "buy":
+            # Heartbeat: once per HEARTBEAT_EVERY_S emit a status line even
+            # when not firing, so the operator can SEE the loop is alive and
+            # what is blocking it. Without this the loop is silent unless
+            # it fires or errors, which turned the last debugging session
+            # into an unnecessary detective story.
+            now_mono = time.monotonic()
+            if now_mono - last_heartbeat_mono >= HEARTBEAT_EVERY_S:
+                last_heartbeat_mono = now_mono
+                held_txt = (f"{decision['held_side']} "
+                            f"${decision['held_cost']:.2f}"
+                            if decision["held_side"] else "no clear held side")
+                underdog = "UP" if decision["held_side"] == "DOWN" else (
+                    "DOWN" if decision["held_side"] == "UP" else None)
+                udog_ask = (up_ask if underdog == "UP"
+                            else down_ask if underdog == "DOWN" else None)
+                udog_txt = (f"{underdog} ask "
+                            f"{float(udog_ask):.3f}"
+                            if udog_ask is not None and underdog else "n/a")
+                status = (skip_reason if skip_reason
+                          else ("fires" if decision["action"] == "buy"
+                                else decision["reason"]))
+                on_event("cheaphedge",
+                         f"watch T-{remaining:.0f} | held {held_txt} | "
+                         f"udog {udog_txt} | traded {current_traded_side or '-'}"
+                         f" | {status}",
+                         "info")
+
+            if skip_reason or decision["action"] != "buy":
                 await asyncio.sleep(config.CHEAP_HEDGE_POLL_SECONDS)
                 continue
 

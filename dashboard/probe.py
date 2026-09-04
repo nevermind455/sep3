@@ -570,6 +570,27 @@ def _install_locked(state: TerminalState, mirror_path: str | None = None):
         return inner
     _patch(strategy, "final_decision", wrap_final)
 
+    # Also wrap strategy.minority_decision. Under SIGNAL_MINORITY_RULE the
+    # bot picks its side through this function, not final_decision, so
+    # state.decision would otherwise reflect the diagnostic majority side
+    # rather than the side actually traded. Downstream code that checks
+    # "what direction is the strategy trading right now" (cheap-hedge in
+    # particular) needs the true traded side to work under minority rule.
+    def wrap_minority(orig):
+        def inner(price_side, book_side, chainlink_side):
+            out = orig(price_side, book_side, chainlink_side)
+            try:
+                with state.lock():
+                    if (state.round_key is not None
+                            and state.strategy_round_key == state.round_key):
+                        state.decision.set(out)
+                        state.decision_forced = False
+            except Exception as exc:
+                _telemetry_failed(state, "minority decision probe", exc)
+            return out
+        return inner
+    _patch(strategy, "minority_decision", wrap_minority)
+
     # ---- market discovery ------------------------------------------------
     def wrap_tokens(orig):
         def inner(*a, **kw):

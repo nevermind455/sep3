@@ -46,9 +46,7 @@ def evaluate_cheap_hedge(
     min_held_cost: float,
     loss_cap: float,
     max_hedge_cost: float,
-    price_side: str | None,
-    book_side: str | None,
-    chainlink_side: str | None,
+    current_traded_side: str | None,
     require_strong_signal: bool,
     already_hedged: bool,
 ) -> dict[str, Any]:
@@ -128,21 +126,24 @@ def evaluate_cheap_hedge(
         return out
 
     if require_strong_signal:
-        # A signal that has already flipped means the reversal is happening
-        # NOW; buying the underdog then is chasing, not hedging. All three
-        # signals must still agree with the currently-held side.
-        for sig, name in (
-            (price_side, "SIG_PRICE"),
-            (book_side, "SIG_BOOK"),
-            (chainlink_side, "SIG_CHAINLINK"),
-        ):
-            if sig not in ("UP", "DOWN"):
-                continue
-            if sig != held_side:
-                out["reason"] = (
-                    f"{name}={sig} already disagrees with held {held_side}"
-                )
-                return out
+        # Refuse if the strategy is CURRENTLY trading the opposite side -
+        # that is a reversal in progress, and buying the underdog then is
+        # chasing, not hedging. Passing the actual traded side (rather
+        # than the raw SIG_PRICE) is what makes this correct under
+        # SIGNAL_MINORITY_RULE: with minority on, the traded side is the
+        # dissenting signal, so an "any signal disagrees" check would
+        # refuse every legitimate hedge by design.
+        #
+        # A None current side is not a refusal - just means we do not know
+        # the last direction, which is common at round start before the
+        # first phase-2 evaluation lands.
+        if (current_traded_side in ("UP", "DOWN")
+                and current_traded_side != held_side):
+            out["reason"] = (
+                f"strategy currently trading {current_traded_side}, "
+                f"opposite of held {held_side}"
+            )
+            return out
 
     # Sizing: cap the reversal loss at LOSS_CAP.
     # We need enough hedge shares to recover (held_cost - loss_cap) when the
