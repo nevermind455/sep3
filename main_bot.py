@@ -571,6 +571,32 @@ def _authority_side(price_side, book_side, chainlink_side):
     return None
 
 
+def _must_fire_side(price_side, book_side, chainlink_side, *, last_side=None):
+    """Pick a placeable side when PHASE2_MUST_FIRE cannot abstain.
+
+    Configured authority still wins. If SIG PRICE is flat at the strike, use
+    the diagnostic vote, then book, then Chainlink, then the last accepted
+    side. A last-resort UP keeps the cycle from dying with no order.
+    """
+    configured = _authority_side(price_side, book_side, chainlink_side)
+    if configured in ("UP", "DOWN"):
+        source = ("SIG PRICE" if price_side in ("UP", "DOWN")
+                  else "BOOK+CHAINLINK FALLBACK")
+        if config.SIGNAL_MINORITY_RULE:
+            source = "MINORITY"
+        return configured, source
+    diagnostic = strategy.final_decision(price_side, book_side, chainlink_side)
+    if diagnostic in ("UP", "DOWN"):
+        return diagnostic, "DIAGNOSTIC"
+    if book_side in ("UP", "DOWN"):
+        return book_side, "SIG BOOK"
+    if chainlink_side in ("UP", "DOWN"):
+        return chainlink_side, "SIG CHAINLINK"
+    if last_side in ("UP", "DOWN"):
+        return last_side, "LAST SIDE"
+    return "UP", "MUST-FIRE DEFAULT"
+
+
 stop_event = threading.Event()
 
 
@@ -1065,15 +1091,30 @@ async def run_bot():
 
             diagnostic_side = strategy.final_decision(
                 price_side, book_side, chainlink_side)
+            # Anchor holdings before a must-fire fallback so LAST SIDE can
+            # reuse a durable accepted direction. Minority still waits below
+            # when must-fire is off, so a restart sample cannot look like a flip.
+            if config.PHASE2_MUST_FIRE:
+                signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             if (price_side is None
-                    and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
+                    and not config.SIGNAL_PRICE_FALLBACK_COMBINED
+                    and not config.PHASE2_MUST_FIRE):
                 print(f"{_ts()} [RISK] No order: fresh SIG PRICE is neutral or unavailable.")
                 await asyncio.sleep(0.2)
                 continue
             # Resolve the configured authority after publishing the diagnostic
             # vote. SIG PRICE wins whenever it speaks. The fallback is reachable
             # only when it does not, and requires Book + Chainlink agreement.
-            side = _authority_side(price_side, book_side, chainlink_side)
+            if config.PHASE2_MUST_FIRE:
+                side, authority_source = _must_fire_side(
+                    price_side, book_side, chainlink_side,
+                    last_side=signal_epoch.accepted_side or signal_epoch.observed_side)
+            else:
+                side = _authority_side(price_side, book_side, chainlink_side)
+                authority_source = (
+                    "MINORITY" if config.SIGNAL_MINORITY_RULE else
+                    "SIG PRICE" if price_side in ("UP", "DOWN") else
+                    "BOOK+CHAINLINK FALLBACK")
             signal_epoch.observe(side)
             if side is None:
                 if config.SIGNAL_PRICE_FALLBACK_COMBINED:
@@ -1090,12 +1131,8 @@ async def run_bot():
             # been observed. Doing this earlier in minority mode made the first
             # post-restart sample look like a verified signal flip and could
             # authorize the complementary leg immediately.
-            signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
-
-            authority_source = (
-                "MINORITY" if config.SIGNAL_MINORITY_RULE else
-                "SIG PRICE" if price_side in ("UP", "DOWN") else
-                "BOOK+CHAINLINK FALLBACK")
+            if not config.PHASE2_MUST_FIRE:
+                signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             print(
                 f"{_ts()} [SIGNAL] price={price_side} book={book_side or 'n/a'} "
                 f"chainlink={chainlink_side} -> diagnostic={diagnostic_side or 'n/a'} "

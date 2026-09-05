@@ -1079,6 +1079,13 @@ async def t_phase2_must_fire_places_instead_of_skipping():
           flipped["order_sides"] == ["UP"] and flipped["orders"] == 1,
           str(flipped))
 
+    flat = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=(None,) * 8, book_votes=("UP",) * 8,
+        chainlink_vote="UP", diagnostic_side="UP", must_fire=True)
+    check("must-fire places when SIG PRICE is flat at the strike",
+          flat["order_sides"] == ["UP"] and flat["orders"] == 1, str(flat))
+
 
 async def t_phase2_price_signal_is_the_only_order_side_authority():
     matching = await _drive_phase2_with_hold(
