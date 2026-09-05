@@ -119,7 +119,6 @@ def t_ledger_open_inventory_is_per_condition():
 
 
 def t_paper_late_trim_floor_opens_t40_only_when_enabled():
-    import tests_paper as tp
     end = (int(time.time()) // 300 + 1) * 300
     sampled = end - 40.0
     original_unix, original_wall = __import__("timer").unix, __import__("timer").wall

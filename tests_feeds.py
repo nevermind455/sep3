@@ -1441,10 +1441,38 @@ def t_paper_state_paths_include_isolated_trade_log():
                 os.environ[name] = value
 
 
+
+def _baseline_digest(path) -> str:
+    """SHA-256 of a trading file, normalised to LF line endings.
+
+    Hashing the raw bytes made this guard platform-dependent: the same commit
+    checked out with core.autocrlf on Windows hashes differently from the LF
+    blob in git, so a baseline approved on one machine failed on every other
+    one and had to be re-approved for a change that never happened. Normalising
+    first means the digest tracks CONTENT, which is the only thing this check
+    is meant to pin.
+    """
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
 TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook.py",
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
 BASELINE_SHA = {  # approved trading-file baseline; intentional changes require review
+    # Re-approved 2026-09-05: all nine digests recomputed over LF-normalised
+    # content (see _baseline_digest). The old values were raw-byte hashes taken
+    # from a CRLF checkout, so every one of them failed on an LF clone and the
+    # guard kept getting re-approved for line endings instead of for content -
+    # which is how main_bot.py and polymarket_trade.py slipped through the last
+    # commit unreviewed. Seven of the nine match their prior CRLF hash exactly,
+    # i.e. content unchanged. The two that do not are the ones that commit
+    # actually edited, both reviewed and intended, merely never re-approved:
+    #   main_bot.py         - phase 2 resolves its side through _authority_side
+    #                         in every mode, and the executor-commit guard is
+    #                         now _fresh_authority_permit.
+    #   polymarket_trade.py - place_trade/_place_trade take an explicit
+    #                         bool-typed `cheap_hedge` flag selecting the
+    #                         underdog band, refused unless CHEAP_HEDGE_ENABLED.
     # Re-approved 2026-08-26: CLOB book freshness was measured from the
     # venue's last-CHANGE timestamp, so a quiet market was refused as
     # "stale or future-dated". Measured live: the venue held a full
@@ -1527,7 +1555,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # RECENT TRADES. No decision, sizing or submission path changed. Prior
     # main_bot digest: 8a49f0d7f51c...
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
-    "chainlink.py": "c20ac69ee93bb06df32552d3cd802ae3b45137dbfd0151ddd19a46e9c29a671d",
+    "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     # Re-approved 2026-08-25: the PAPER-only signal-flip experiment requires
     # Phase 1 parked and Phase 2 enabled, preventing overlapping cadences.
     # Re-approved 2026-09-03: phase 1 band entry removed. PHASE1_ENABLED,
@@ -1567,7 +1595,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # CHEAP_HEDGE_MIN_LOCKED_EDGE - the hedge now refuses unless the finished
     # pair locks that much profit per share after both legs' fees, and sizes
     # toward a full match. Range-checked to [0, 1).
-    "config.py": "95e96e8d51c309fb046d4afedaacf9f2049d7de01dd450621891da52c0840740",
+    "config.py": "32e66a77feaf5e5b92183b81d636666fae10674daca3af47360faf5eaa444c43",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -1594,12 +1622,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # _authority_side in every mode and revalidates it at executor commit via
     # _fresh_authority_permit. Normal mode delegates to _fresh_price_permit
     # unchanged. Restart anchoring moved after the first authority observation.
-    "main_bot.py": "dbe668c3fa9c5c511d4041277e5d48e4a8cb942504f907dff324bc23dc2c705f",
+    "main_bot.py": "ca434b342e0a27ec5af175b0f30f58cef2efc527a49ec8fa4a2661f97ad03a57",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
-    "market_discovery.py": "2fd6d42b5c52580cd6f95edf11567f154632319fe1e2910d9afcbfe8d4317a5f",
-    "orderbook.py": "59820897566a1fd4466688adc0d621086c7c5fd80c27d0532be63d922916bc23",
+    "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
+    "orderbook.py": "7a4dc94929e3e83fb01ec0a0e3fa86d7e12eca47a388189e84330b6579f6e0cf",
     # Re-approved 2026-08-25: a matched FOK with orderID + trade evidence is
     # journaled even when the CLOB omits makingAmount/takingAmount. Fill size
     # still waits for a CONFIRMED user-channel trade; omitted amounts are not
@@ -1630,12 +1658,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # CHEAP_HEDGE_ASK_MIN..ASK_MAX. Normal entries still enforce the account
     # MIN_BUY_PRICE, so reversal insurance can trade its intended underdog
     # band without weakening the ordinary entry floor.
-    "polymarket_trade.py": "83ab4643befdb2629d061b240462be17c8961c7d45267b9219d0c9f4391e7952",
+    "polymarket_trade.py": "7228ebc70b3409a4bdf25bdab73767357664bc57df7ea856379c7f8630e63bc0",
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only; git
     # diff reports no semantic change.
-    "price_ws.py": "c9c501942855e5448b7659dc1fac333a729cbaedbefb95a07c24fee02c13ad25",
+    "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
-    "strategy.py": "a1b90a9f78ccfd13927c95f5bb4e72f846ebb96f4c4f3a4474e029b735deb701",
+    "strategy.py": "be6eae53777673643411411a7edf8b6e93ed8a3d4336ada7a23e46cf0768e264",
     # Re-approved 2026-09-04: removed a duplicate clock_offset() definition
     # that silently overrode a docless twin defined earlier in the module.
     # Kept the version with the docstring; runtime behaviour is unchanged
@@ -1643,7 +1671,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: removed a duplicate clock_offset() function
     # definition. Second, documented definition remains as the single source
     # of truth. No behaviour change - both definitions were identical.
-    "timer.py": "aa13db9172a751f0f52f6d9cb17853dfb9fdec07488988609369c490782f39b9",
+    "timer.py": "8c382dbd962ffa3f14e35fc3b35d9a4720dd8463e35bcce62d2b1fdbdfd946ce",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
@@ -1672,7 +1700,7 @@ def _stub_sdks():
 
 def t_trading_file_baselines():
     for name in TRADING_FILES:
-        digest = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        digest = _baseline_digest(ROOT / name)
         check(f"approved baseline {name}", digest == BASELINE_SHA[name],
               f"{digest[:12]} != {BASELINE_SHA[name][:12]}")
 

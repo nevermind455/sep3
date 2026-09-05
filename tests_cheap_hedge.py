@@ -251,6 +251,59 @@ def t_side_selection_flips_when_up_is_the_held_side():
           d["action"] == "buy" and d["side"] == "DOWN", str(d))
 
 
+# --- price cap must carry the locked-edge proof into the order --------------
+# The decision's max_price becomes the FOK's ceiling, and a FOK walks the book.
+# Capping at ask_max let an authorized hedge fill above the ask the gate was
+# evaluated against, turning a proven pair into a guaranteed loss.
+def _locked(all_in: float, price: float, fee_rate: float = 0.07) -> float:
+    return 1.0 - (all_in + price + fee_rate * price * (1.0 - price))
+
+
+def t_price_cap_never_authorizes_a_losing_fill():
+    # Held 40 DOWN at 0.86 all-in. At the 0.10 ask the pair locks +0.034, but
+    # a fill at the 0.20 band top would lock -0.071 on every matched pair.
+    d = evaluate_cheap_hedge(**{
+        **BASE,
+        "down_cost": 34.4, "down_shares": 40.0,   # 0.86/share all-in
+        "up_ask": 0.10,
+        "ask_min": 0.10, "ask_max": 0.20,
+    })
+    check("still fires at the observed ask", d["action"] == "buy", str(d))
+    check("cap is tightened below the sanity band top",
+          d["max_price"] < 0.20, str(d["max_price"]))
+    check("a fill at the cap still clears min_locked_edge",
+          _locked(0.86, d["max_price"]) >= BASE["min_locked_edge"] - 1e-9,
+          f"cap={d['max_price']} locked={_locked(0.86, d['max_price'])}")
+    check("one tick above the cap would NOT clear it",
+          _locked(0.86, d["max_price"] + 0.01) < BASE["min_locked_edge"],
+          str(d["max_price"]))
+    check("cap is never below the ask that authorized the order",
+          d["max_price"] >= d["ask"], str(d))
+
+
+def t_price_cap_stays_at_the_band_when_the_band_binds():
+    # A cheap held side (0.60 all-in) clears the edge well past 0.15, so the
+    # sanity band remains the binding constraint and the cap does not move.
+    d = evaluate_cheap_hedge(**BASE)
+    check("cap stays at ask_max when the edge allows more",
+          d["max_price"] == BASE["ask_max"], str(d["max_price"]))
+
+
+def t_price_cap_reported_even_when_it_equals_the_edge_ceiling():
+    d = evaluate_cheap_hedge(**{
+        **BASE,
+        "down_cost": 34.4, "down_shares": 40.0,
+        "up_ask": 0.10,
+        "ask_min": 0.10, "ask_max": 0.20,
+        "min_locked_edge": 0.0,
+    })
+    check("a zero required edge still caps at break-even",
+          d["action"] == "buy" and d["max_price"] < 0.20, str(d))
+    check("break-even cap locks ~0.0 per pair",
+          abs(_locked(0.86, d["max_price"])) < 1e-9,
+          str(_locked(0.86, d["max_price"])))
+
+
 def main() -> int:
     for name, fn in list(globals().items()):
         if name.startswith("t_") and callable(fn):

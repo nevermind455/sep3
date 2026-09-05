@@ -25,6 +25,12 @@ every matched pair carries the same locked edge and leaving shares unmatched
 just leaves that profit on the table. ``max_hedge_cost`` is the spend ceiling
 when a full match would cost more than the operator wants to commit.
 
+The returned ``max_price`` is the price the proof still holds at, not the top
+of the sanity band. A FOK walks the book, so an order capped at ``ask_max``
+could fill above the ask the gate was evaluated against and turn a proven pair
+into a guaranteed loss; the cap is therefore solved back out of the locked-edge
+inequality (see ``_max_price_for_locked_edge``).
+
 Deliberately independent of LATE_TRIM. That module fires later (T-60..T-20),
 buys the FAVORITE, and closes a hole that already exists. This one fires
 anywhere before its cutoff, buys the UNDERDOG, and only when the finished
@@ -42,6 +48,40 @@ def _finite(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _max_price_for_locked_edge(held_all_in: float, fee_rate: float,
+                               min_locked_edge: float) -> float | None:
+    """Highest fill price that still leaves ``min_locked_edge`` per pair.
+
+    The gate below proves the pair is profitable at the ask we can SEE, but a
+    FOK walks the book and fills anywhere up to its cap. Capping at ``ask_max``
+    therefore let an authorized hedge fill at a price the proof never covered:
+    at a 0.86 held all-in a 0.10 ask locks +0.034/pair, while the same order
+    filling at the 0.20 band top locks -0.071 - a guaranteed loss on every
+    matched pair. So solve the gate for price and cap the order there.
+
+        1 - (held_all_in + p + fee_rate*p*(1-p)) >= min_locked_edge
+
+    Rearranged with ``B = 1 - held_all_in - min_locked_edge``:
+
+        fee_rate*p^2 - (1 + fee_rate)*p + B >= 0
+
+    On [0, 1] that parabola's vertex sits at (1+f)/(2f) >= 1 for any
+    fee_rate <= 1, so the expression is decreasing across the whole price
+    range and the smaller root is the ceiling. Returns None when no price
+    works (the pair cannot clear the required edge at any cost).
+    """
+    b = 1.0 - held_all_in - min_locked_edge
+    if not math.isfinite(b) or b <= 0.0:
+        return None
+    if fee_rate <= 0.0:
+        return b
+    disc = (1.0 + fee_rate) ** 2 - 4.0 * fee_rate * b
+    if not math.isfinite(disc) or disc < 0.0:
+        return None
+    root = ((1.0 + fee_rate) - math.sqrt(disc)) / (2.0 * fee_rate)
+    return root if math.isfinite(root) and root > 0.0 else None
 
 
 def evaluate_cheap_hedge(
@@ -196,12 +236,30 @@ def evaluate_cheap_hedge(
         out["reason"] = "hedge cost non-positive"
         return out
 
+    # ---- price cap: carry the proof into the order -------------------------
+    # The caller turns `max_price` into the FOK's ceiling, and a FOK walks the
+    # book. Capping at ask_max would authorize a fill the locked-edge test
+    # never covered, so cap at the highest price that still clears the edge.
+    edge_cap = _max_price_for_locked_edge(held_all_in, fee_rate, min_locked_edge)
+    if edge_cap is None:
+        out["reason"] = "no fill price clears the required locked edge"
+        return out
+    price_cap = min(ask_max, edge_cap)
+    out["max_price"] = price_cap
+    if price_cap < hedge_ask:
+        # Unreachable while the gate above holds (it passed AT hedge_ask), but
+        # a rounding-edge case here would send an order that cannot fill, so
+        # refuse rather than emit one.
+        out["reason"] = (
+            f"edge cap {price_cap:.4f} is below the {hedge_ask:.4f} ask"
+        )
+        return out
+
     out.update({
         "action": "buy",
         "side": hedge_side,
         "reason": "locked pair",
         "amount": hedge_cost,
-        "max_price": ask_max,
         "shares": hedge_cost / hedge_ask,
     })
     return out

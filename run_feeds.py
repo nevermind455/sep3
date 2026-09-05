@@ -1245,7 +1245,10 @@ async def _rotation_loop(hub, stop) -> None:
     while not stop.is_set():
         try:
             sampled = timer.unix()
-            remain = timer.seconds_left(sampled)
+            # No `remain` sample here on purpose: every consumer below sits
+            # behind a discovery call that can block for ~21s, so a value read
+            # at the top of the loop is stale by the time it would be used.
+            # Each site re-reads the clock (see `remain_now`).
             window = timer.window_start(sampled)
             key = window
             if key != cleared_key:
