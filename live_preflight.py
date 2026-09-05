@@ -32,6 +32,35 @@ def main() -> int:
     print("LIVE PREFLIGHT - every gate an order must clear")
     print("=" * 74)
 
+    # 0. the master switch -------------------------------------------------
+    # Checked first because it is the only gate that produces NO refusal line
+    # at all: with phase 2 parked main_bot never enters the order path, so the
+    # log shows a healthy "Running | ... | idle | phase 2 parked" every 30s and
+    # nothing else. Every other gate below announces itself when it refuses.
+    if not config.PHASE2_ENABLED:
+        line(BAD, "PHASE2_ENABLED",
+             "off (default) - the order path is never entered; set PHASE2_ENABLED=1")
+        failures += 1
+    else:
+        line(OK, "PHASE2_ENABLED", "on - phase 2 may submit orders")
+
+    # Orders are confined to a window inside each 5-minute round, so "nothing
+    # happening" is expected for most of it. State the window explicitly.
+    trade_window_s = config.TRADE_LAST_SECONDS - config.MIN_SECONDS_TO_EXPIRY
+    if trade_window_s <= 0:
+        line(BAD, "trade window",
+             f"TRADE_LAST_SECONDS={config.TRADE_LAST_SECONDS} <= "
+             f"MIN_SECONDS_TO_EXPIRY={config.MIN_SECONDS_TO_EXPIRY:.0f} - no window exists")
+        failures += 1
+    else:
+        attempts = int(trade_window_s // config.TRADE_INTERVAL_SECONDS)
+        left = timer.seconds_left(timer.unix())
+        inside = config.MIN_SECONDS_TO_EXPIRY <= left <= config.TRADE_LAST_SECONDS
+        line(OK, "trade window",
+             f"T-{config.TRADE_LAST_SECONDS}..T-{config.MIN_SECONDS_TO_EXPIRY:.0f} "
+             f"({trade_window_s:.0f}s of every 300s, <={attempts} attempts) | "
+             f"now T-{left} -> {'INSIDE' if inside else 'outside, idle is normal'}")
+
     # 1. credentials -------------------------------------------------------
     missing = [k for k in ("POLY_PRIVATE_KEY", "POLY_FUNDER", "POLY_SIGNATURE_TYPE")
                if not (os.environ.get(k) or "").strip()]
