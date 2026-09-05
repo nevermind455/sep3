@@ -94,6 +94,68 @@ for _ in range(5):
 print('median drift %+.3fs (limit 2.000s)'%st.median(s))"
 ```
 
+## Latency envelope
+
+The bot trades a 5-minute Polymarket book with FOK orders, so RTT from this
+box to the venue directly affects fill quality. A host that runs the bot
+profitably at home can lose money from a VPS in the wrong region because
+the same signal reaches the book a beat late and takes worse fills.
+
+Measure the host before you commit to it:
+
+```bash
+python vps_latency_check.py
+```
+
+This times pooled samples to every public endpoint the bot reads
+(`clob.polymarket.com/time`, `/book`, `gamma-api`, Binance), reports the
+CLOB clock offset the bot's own `check_clock` would measure, and reads
+`/proc/stat` for CPU steal. Exit code is 0 when every headline is inside
+the recommended envelope and 1 otherwise — safe to add as
+`ExecStartPre=` in the systemd unit below.
+
+Recommended envelope for LIVE trading (matches the thresholds in
+`vps_latency_check.py`):
+
+| Signal                             | OK       | WARN       | FAIL beyond |
+| ---                                | ---      | ---        | ---         |
+| `clob.polymarket.com/time` p50     | ≤ 120 ms | ≤ 240 ms   | > 240 ms    |
+| `clob.polymarket.com/book` p50     | ≤ 120 ms | ≤ 240 ms   | > 240 ms    |
+| `gamma-api.polymarket.com` p50     | ≤ 200 ms | ≤ 400 ms   | > 400 ms    |
+| `api.binance.com/ticker` p50       | ≤ 150 ms | ≤ 300 ms   | > 300 ms    |
+| CLOB clock offset (\|median\|)     | ≤ 50 ms  | ≤ 250 ms   | > 250 ms    |
+| CPU steal (1s sample)              | ≤ 1%    | ≤ 5%      | > 5%       |
+
+If you are outside the OK band, move the VPS to a closer region before
+tuning config. `us-east-1` (AWS Virginia) is typically closest to
+Polymarket's Cloudflare edge; check with `dig clob.polymarket.com` on the
+VPS and compare against your PC — the same octet pattern usually means the
+same edge cluster.
+
+Only once the host is inside the OK envelope do the strategy overrides
+in `.env.vps.example` start to matter. Copy that template as `.env` and
+edit it in place:
+
+```bash
+cp .env.vps.example .env
+chmod 600 .env
+# edit .env, add credentials, remove the shebang comments above them
+```
+
+The template narrows the entry envelope on a distant host (`MAX_BUY_PRICE=0.85`,
+`ORDERBOOK_MAX_AGE_SECONDS=3.0`, `ROUND_PREPARE_LEAD_SECONDS=45`) so the bot
+refuses more marginal fills rather than accepting them at worse prices than a
+home connection would. It does not enable any hidden edge - it trades a few
+missed fills for far fewer bad fills, which is the right direction on a host
+whose RTT is measured in hundreds of milliseconds.
+
+Run PAPER for at least a day on the VPS with these settings before
+promoting to LIVE. Compare `paper_trade_log.csv` from the VPS against
+the same window from home. If the reject-rate difference is small and
+the fill quality is comparable, the VPS is good enough. If the VPS
+still shows systematically worse fills, the box is too far - the tune
+is not the fix.
+
 ## Permissions
 
 On POSIX, `config.py` refuses to start unless `.env` is not group/other
@@ -120,6 +182,9 @@ Wants=network-online.target
 Type=simple
 User=btcbot
 WorkingDirectory=/opt/btcbot
+# Refuse to start if the host is outside the latency envelope. Comment
+# this line out only after you have decided you want to run there anyway.
+ExecStartPre=/opt/btcbot/.venv/bin/python vps_latency_check.py
 ExecStart=/opt/btcbot/.venv/bin/python run_feeds.py --paper
 Restart=always
 RestartSec=10
