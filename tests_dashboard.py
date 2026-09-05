@@ -515,6 +515,62 @@ def test_render_row_resets() -> None:
     check("alt on constant", ALT_ON.startswith("\x1b"))
 
 
+def test_too_small_frame_matches_actual_size() -> None:
+    """The too-small fallback must match the ACTUAL terminal size exactly.
+
+    A frame wider or taller than the terminal is exactly what "boxes
+    overlapping" looks like: the terminal wraps or scrolls the excess. The
+    fallback exists so the renderer never emits such a frame, so its geometry
+    is the invariant to guard.
+    """
+    from dashboard.layout import too_small_frame
+
+    for cols in (1, 5, 10, 20, 30, 39, 40, 60, 120):
+        for rows in (1, 2, 4, 9, 10, 20):
+            frame = too_small_frame(cols, rows, min_cols=40, min_rows=10)
+            check(f"too_small_frame row count matches at {cols}x{rows}",
+                  len(frame) == rows, f"got {len(frame)}")
+            for i, row in enumerate(frame):
+                width = sum(len(text) for text, _ in row)
+                check(f"too_small_frame row {i} width matches at {cols}x{rows}",
+                      width == cols, f"row width {width} != {cols}")
+
+
+def test_too_small_frame_names_the_target_size() -> None:
+    from dashboard.layout import too_small_frame
+
+    frame = too_small_frame(30, 8, min_cols=60, min_rows=18)
+    joined = "\n".join("".join(t for t, _ in row) for row in frame)
+    check("fallback names the required size", "60" in joined and "18" in joined,
+          joined)
+    check("fallback names the current size", "30" in joined and "8" in joined,
+          joined)
+    check("fallback says the diagnosis", "small" in joined.lower(), joined)
+
+
+def test_renderer_reports_too_small_flag() -> None:
+    """Renderer.too_small must reflect the actual terminal, not the clamped
+    layout size."""
+    from dashboard.renderer import Renderer
+
+    r = Renderer.__new__(Renderer)
+    r.min_cols, r.min_rows = 40, 10
+
+    r.actual_cols, r.actual_rows = 30, 24
+    check("too_small trips when only cols is below min",
+          r.too_small is True, f"{r.actual_cols}x{r.actual_rows}")
+
+    r.actual_cols, r.actual_rows = 80, 8
+    check("too_small trips when only rows is below min",
+          r.too_small is True, f"{r.actual_cols}x{r.actual_rows}")
+
+    r.actual_cols, r.actual_rows = 40, 10
+    check("too_small false at exact minimum", r.too_small is False)
+
+    r.actual_cols, r.actual_rows = 120, 40
+    check("too_small false well above minimum", r.too_small is False)
+
+
 # ------------------------------------------------- 3. data integrity ---
 NUMERIC_BAN = ("0.00%", "$1,", "$2,", "12.3", "45.6")
 

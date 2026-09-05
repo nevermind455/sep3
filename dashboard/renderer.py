@@ -58,7 +58,13 @@ class Renderer:
         self.g = glyphs()
         self.last_error: str | None = None
         self._size_pending: tuple[int, int] | None = None
+        # actual_cols/actual_rows is what the terminal actually reports; a
+        # window smaller than min_cols x min_rows still has a real size, and
+        # draw() paints the too-small fallback at that size rather than
+        # writing a wider frame into a narrower terminal (which is what looks
+        # like "boxes overlapping").
         self.cols, self.rows = 0, 0
+        self.actual_cols, self.actual_rows = 0, 0
         self.cols, self.rows = self.size()
         self._prev: list[str] = []
         self._force = True
@@ -75,11 +81,14 @@ class Renderer:
     # ------------------------------------------------------------- lifecycle
     def size(self) -> tuple[int, int]:
         try:
-            c, r = shutil.get_terminal_size(fallback=(120, 40))
+            raw_c, raw_r = shutil.get_terminal_size(fallback=(120, 40))
         except Exception as exc:
             self.last_error = f"terminal size failed: {exception_summary(exc)}"
-            c, r = 120, 40
-        c, r = max(self.min_cols, c), max(self.min_rows, r)
+            raw_c, raw_r = 120, 40
+        # Track the ACTUAL terminal size unclamped, so draw() can decide
+        # whether to paint the layout or the too-small fallback.
+        self.actual_cols, self.actual_rows = max(1, int(raw_c)), max(1, int(raw_r))
+        c, r = max(self.min_cols, raw_c), max(self.min_rows, raw_r)
         # Windows reports a ±1 window size while a frame is painting. Adopting
         # that every frame rebuilds the layout and used to full-clear the alt
         # screen — the shake and the blank flash.
@@ -92,6 +101,17 @@ class Renderer:
             return c, r
         self._size_pending = (c, r)
         return current
+
+    @property
+    def too_small(self) -> bool:
+        """True when the actual terminal is below the layout's minimum.
+
+        The layout still builds correctly at min_cols x min_rows, but writing
+        those rows into a narrower/shorter terminal lets the terminal wrap
+        them — exactly the visual "overlap" a small window shows.
+        """
+        return (self.actual_cols < self.min_cols
+                or self.actual_rows < self.min_rows)
 
     def _on_winch(self, *_a) -> None:
         self._resized = True
@@ -185,6 +205,17 @@ class Renderer:
         if self._resized or (self._prev and len(frame) != len(self._prev)):
             self._resized = False
             self._force = True
+
+        # If the real terminal is smaller than the layout minimum, the caller
+        # built a frame that is wider or taller than what fits. Writing it
+        # would let the terminal wrap each row into two - the shape a small
+        # window shows as "overlapping boxes". Paint a shaped-to-fit fallback
+        # message instead. Layout is imported here (not at module top) to
+        # avoid a circular import with dashboard.__init__.
+        if self.too_small:
+            from .layout import too_small_frame
+            frame = too_small_frame(self.actual_cols, self.actual_rows,
+                                    self.min_cols, self.min_rows)
 
         lines = [render_row(row) for row in frame]
         buf = []

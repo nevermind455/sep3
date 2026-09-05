@@ -1030,3 +1030,36 @@ def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
     frame = [pad(r, cols) for r in frame[:rows]]
     _overlay(frame, snap, cols, rows, g)
     return frame
+
+
+# ---------------------------------------------------------------- fallback ---
+def too_small_frame(cols: int, rows: int, min_cols: int, min_rows: int) -> list[Row]:
+    """A minimal fallback the renderer paints when the terminal is below the
+    layout's minimum. Prevents the alternative, which is writing a wider row
+    into a narrower terminal and letting the terminal wrap it - the shape
+    that looks like "boxes overlapping".
+
+    Guarantees the same shape contract as ``build``: exactly ``rows`` rows,
+    each exactly ``cols`` visible characters wide, so ``Renderer.draw`` can
+    write it without measuring the terminal a second time.
+    """
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    lines = [
+        "Terminal too small.",
+        f"Resize to at least {int(min_cols)} x {int(min_rows)}.",
+        f"Current: {cols} x {rows}",
+    ]
+    frame: list[Row] = []
+    top_pad = max(0, (rows - len(lines)) // 2)
+    for _ in range(top_pad):
+        frame.append(blank(cols))
+    for text in lines:
+        if len(frame) >= rows:
+            break
+        clipped = trunc(text, cols)
+        row: Row = [(clipped.center(cols), PAPER)]
+        frame.append(row)
+    while len(frame) < rows:
+        frame.append(blank(cols))
+    return [pad(r, cols) for r in frame[:rows]]
