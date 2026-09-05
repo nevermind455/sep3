@@ -805,6 +805,8 @@ async def run_bot():
         f"current round {current_round_window_et()} (compare with Polymarket)"
     )
     print(f"{_ts()} [BOT] Kill switch: press Enter in this terminal to stop safely.")
+    if config.PHASE2_MUST_FIRE:
+        print(f"{_ts()} [BOT] PHASE2_MUST_FIRE is ON — strategy skips will not block a cycle.")
     if config.LATE_TRIM_ENABLED:
         print(
             f"{_ts()} [TRIM] last-minute loss trim ON | "
@@ -965,7 +967,8 @@ async def run_bot():
                 f"ends in {remain}s | {phase} | {price_txt}"
             )
 
-        if (config.SKIP_JOINED_ROUND and joined_window is not None
+        if (config.SKIP_JOINED_ROUND and not config.PHASE2_MUST_FIRE
+                and joined_window is not None
                 and active_window == joined_window):
             if skip_logged_window != active_window:
                 skip_logged_window = active_window
@@ -1014,7 +1017,7 @@ async def run_bot():
                     print(f"{_ts()} [RISK] SIG CHAINLINK abstains this round "
                           f"(missing {', '.join(abstaining)}); trading continues "
                           f"on the signals that are ready.")
-            if blocking:
+            if blocking and not config.PHASE2_MUST_FIRE:
                 missing = blocking
                 structural = [item for item in missing if "boundary" in item]
                 if structural:
@@ -1035,6 +1038,11 @@ async def run_bot():
                     print(f"{_ts()} [RISK] No order: missing {', '.join(missing)}.")
                 await asyncio.sleep(0.2)
                 continue
+            if blocking and config.PHASE2_MUST_FIRE:
+                print(
+                    f"{_ts()} [BOT] Missing {', '.join(blocking)}; "
+                    f"PHASE2_MUST_FIRE still trades this cycle."
+                )
 
             print(f"{_ts()} [BOT] Trade window ({exact_remaining:.2f}s left) - validating live state...")
 
@@ -1085,9 +1093,14 @@ async def run_bot():
                 bids, asks = await asyncio.to_thread(orderbook.get_orderbook, ob_id)
                 book_side = orderbook.liquidity_signal(bids, asks)
             except Exception as exc:
-                print(f"{_ts()} [MARKET] Orderbook rejected: {type(exc).__name__}: {exc}")
-                await _cooldown(1.0)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [MARKET] Orderbook rejected: {type(exc).__name__}: {exc}")
+                    await _cooldown(1.0)
+                    continue
+                print(
+                    f"{_ts()} [MARKET] Orderbook rejected: {type(exc).__name__}: {exc}; "
+                    f"PHASE2_MUST_FIRE still trades."
+                )
 
             diagnostic_side = strategy.final_decision(
                 price_side, book_side, chainlink_side)
@@ -1198,20 +1211,29 @@ async def run_bot():
                     or (final_cl is None
                         and not config.PHASE2_PARTIAL_SIGNALS
                         and not config.SIGNAL_PRICE_FALLBACK_COMBINED)):
-                print(f"{_ts()} [RISK] No order: a price feed became stale during validation.")
-                await asyncio.sleep(0.2)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [RISK] No order: a price feed became stale during validation.")
+                    await asyncio.sleep(0.2)
+                    continue
+                print(f"{_ts()} [BOT] A price feed became stale; PHASE2_MUST_FIRE keeps {side}.")
             try:
                 final_bids, final_asks = await asyncio.to_thread(
                     orderbook.get_orderbook, ob_id)
                 final_book_side = orderbook.liquidity_signal(final_bids, final_asks)
             except Exception as exc:
+                if not config.PHASE2_MUST_FIRE:
+                    print(
+                        f"{_ts()} [MARKET] Final orderbook validation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    await _cooldown(1.0)
+                    continue
                 print(
                     f"{_ts()} [MARKET] Final orderbook validation failed: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: {exc}; PHASE2_MUST_FIRE still submits."
                 )
-                await _cooldown(1.0)
-                continue
+                final_bids, final_asks = [], []
+                final_book_side = book_side
             final_price_side = price_signal(active_window, start_price, final_lp)
             final_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, final_cl)
