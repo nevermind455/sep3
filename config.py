@@ -216,6 +216,14 @@ SIGNAL_PRICE_FALLBACK_COMBINED = bool(_env_bool(
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")
+
+# When on, every phase-2 cycle must call place_trade for the current side.
+# Complement-leg, signal-flip, and validation-retarget skips are stood down.
+# An empty or unfillable book can still reject at the FOK; that is a venue
+# refusal, not a strategy skip. Off by default.
+PHASE2_MUST_FIRE = bool(_env_bool("PHASE2_MUST_FIRE", False))
+if PHASE2_MUST_FIRE and not PHASE2_ENABLED:
+    raise ValueError("PHASE2_MUST_FIRE requires PHASE2_ENABLED=1")
 if SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL:
     raise ValueError(
         "SIGNAL_MINORITY_RULE selects a single dissenting side; it cannot be "

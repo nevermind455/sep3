@@ -1185,9 +1185,13 @@ async def run_bot():
             if (final_price_side is None
                     and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
                 signal_epoch.observe(None)
-                print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
-                await asyncio.sleep(0.2)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
+                    await asyncio.sleep(0.2)
+                    continue
+                print(f"{_ts()} [BOT] SIG PRICE became neutral; PHASE2_MUST_FIRE keeps {side}.")
+            if final_authority_side is None and config.PHASE2_MUST_FIRE:
+                final_authority_side = side
             signal_epoch.observe(final_authority_side)
             if final_authority_side is None:
                 print(f"{_ts()} [RISK] No order: deciding signals became tied or "
@@ -1195,15 +1199,27 @@ async def run_bot():
                 await asyncio.sleep(0.2)
                 continue
             if final_authority_side != side:
-                print(
-                    f"{_ts()} [RISK] No order: configured decision changed during "
-                    f"validation ({side} -> {final_authority_side})."
-                )
-                await asyncio.sleep(0.2)
-                continue
+                if config.PHASE2_MUST_FIRE:
+                    print(
+                        f"{_ts()} [BOT] Decision changed during validation "
+                        f"({side} -> {final_authority_side}); firing {final_authority_side}."
+                    )
+                    side = final_authority_side
+                else:
+                    print(
+                        f"{_ts()} [RISK] No order: configured decision changed during "
+                        f"validation ({side} -> {final_authority_side})."
+                    )
+                    await asyncio.sleep(0.2)
+                    continue
 
             other_token = down_id if side == "UP" else up_id
-            if other_token in held_tokens:
+            if other_token in held_tokens and config.PHASE2_MUST_FIRE:
+                print(
+                    f"{_ts()} [BOT] Complement already held; "
+                    f"PHASE2_MUST_FIRE still fires {side}."
+                )
+            elif other_token in held_tokens:
                 flip_allowed = False
                 flip_detail = "PAPER signal-flip mode is disabled"
                 flips_enabled = (config.PAPER_ALLOW_SIGNAL_FLIPS if mode == "PAPER"
@@ -1387,6 +1403,7 @@ async def run_bot():
             # Near expiry the selected token can lose all offers.  Book
             # liquidity is transient, so a failed probe skips this attempt
             # only; the next scheduled attempt probes the live book again.
+            selected_bids, selected_asks = final_bids, final_asks
             try:
                 selected_bids, selected_asks = await asyncio.to_thread(
                     orderbook.validate_buy_liquidity,
@@ -1394,28 +1411,38 @@ async def run_bot():
                     config.BET_SIZE, config.MAX_BUY_PRICE, config.MAX_ALLOWED_SPREAD,
                     min_price=config.MIN_BUY_PRICE)
             except ValueError as exc:
+                if not config.PHASE2_MUST_FIRE:
+                    print(
+                        f"{_ts()} [RISK] No order this attempt: "
+                        f"{side} is not buyable - {exc}."
+                    )
+                    _append_trade(
+                        {
+                            "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
+                            "phase": "phase2",
+                            "side": side,
+                            "amount": config.BET_SIZE,
+                            "price_side": final_price_side or "",
+                            "book_side": final_book_side or "",
+                            "chainlink_side": final_chainlink_side or "",
+                            "result": "skipped_unfillable",
+                        }
+                    )
+                    await _cooldown()
+                    continue
                 print(
-                    f"{_ts()} [RISK] No order this attempt: "
-                    f"{side} is not buyable - {exc}."
+                    f"{_ts()} [BOT] {side} probe unfillable ({exc}); "
+                    f"PHASE2_MUST_FIRE still submits."
                 )
-                _append_trade(
-                    {
-                        "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
-                        "phase": "phase2",
-                        "side": side,
-                        "amount": config.BET_SIZE,
-                        "price_side": final_price_side or "",
-                        "book_side": final_book_side or "",
-                        "chainlink_side": final_chainlink_side or "",
-                        "result": "skipped_unfillable",
-                    }
-                )
-                await _cooldown()
-                continue
             except Exception as exc:
-                print(f"{_ts()} [MARKET] Liquidity probe failed: {type(exc).__name__}: {exc}")
-                await _cooldown(1.0)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [MARKET] Liquidity probe failed: {type(exc).__name__}: {exc}")
+                    await _cooldown(1.0)
+                    continue
+                print(
+                    f"{_ts()} [MARKET] Liquidity probe failed: {type(exc).__name__}: {exc}; "
+                    f"PHASE2_MUST_FIRE still submits."
+                )
 
             validation_limit = min(
                 config.BTC_STALE_AFTER,
@@ -1436,7 +1463,7 @@ async def run_bot():
                 _probe.publish_latency("validate", validation_age * 1000.0)
             except Exception:
                 pass
-            if validation_age > validation_limit:
+            if validation_age > validation_limit and not config.PHASE2_MUST_FIRE:
                 print(
                     f"{_ts()} [RISK] No order: validation took {validation_age:.3f}s "
                     f"(limit {validation_limit:.3f}s)."
@@ -1451,9 +1478,11 @@ async def run_bot():
                     or (submit_cl is None
                         and not config.PHASE2_PARTIAL_SIGNALS
                         and not config.SIGNAL_PRICE_FALLBACK_COMBINED)):
-                print(f"{_ts()} [RISK] No order: a price feed went stale before submission.")
-                await asyncio.sleep(0.2)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [RISK] No order: a price feed went stale before submission.")
+                    await asyncio.sleep(0.2)
+                    continue
+                print(f"{_ts()} [BOT] A price feed went stale; PHASE2_MUST_FIRE keeps {side}.")
             submit_book_side = (
                 orderbook.liquidity_signal(selected_bids, selected_asks)
                 if side == "UP" else final_book_side
@@ -1468,9 +1497,13 @@ async def run_bot():
             if (submit_price_side is None
                     and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
                 signal_epoch.observe(None)
-                print(f"{_ts()} [RISK] No order: SIG PRICE is neutral immediately before submission.")
-                await asyncio.sleep(0.2)
-                continue
+                if not config.PHASE2_MUST_FIRE:
+                    print(f"{_ts()} [RISK] No order: SIG PRICE is neutral immediately before submission.")
+                    await asyncio.sleep(0.2)
+                    continue
+                print(f"{_ts()} [BOT] SIG PRICE is neutral; PHASE2_MUST_FIRE keeps {side}.")
+            if submit_authority_side is None and config.PHASE2_MUST_FIRE:
+                submit_authority_side = side
             signal_epoch.observe(submit_authority_side)
             if submit_authority_side is None:
                 print(f"{_ts()} [RISK] No order: deciding signals are tied or "
@@ -1478,12 +1511,19 @@ async def run_bot():
                 await asyncio.sleep(0.2)
                 continue
             if submit_authority_side != side:
-                print(
-                    f"{_ts()} [RISK] No order: configured decision changed immediately "
-                    f"before submission ({side} -> {submit_authority_side})."
-                )
-                await asyncio.sleep(0.2)
-                continue
+                if config.PHASE2_MUST_FIRE:
+                    print(
+                        f"{_ts()} [BOT] Decision changed before submission "
+                        f"({side} -> {submit_authority_side}); firing {submit_authority_side}."
+                    )
+                    side = submit_authority_side
+                else:
+                    print(
+                        f"{_ts()} [RISK] No order: configured decision changed immediately "
+                        f"before submission ({side} -> {submit_authority_side})."
+                    )
+                    await asyncio.sleep(0.2)
+                    continue
             price_side = submit_price_side
             book_side = submit_book_side
             chainlink_side = submit_chainlink_side
@@ -1517,13 +1557,17 @@ async def run_bot():
 
             verb = "Simulating live-book FOK" if mode == "PAPER" else "Placing trade"
             print(f"{_ts()} [BOT] {verb}: {side} ${config.BET_SIZE}")
+            if config.PHASE2_MUST_FIRE:
+                pre_submit_guard = lambda: True
+            else:
+                pre_submit_guard = lambda: _fresh_authority_permit(
+                    active_window, start_price, start_chainlink_price,
+                    submit_book_side, side,
+                    signal_observer=signal_epoch.observe)
             ok = await asyncio.to_thread(
                 place_trade, side, config.BET_SIZE, up_id, down_id,
                 tokens["condition_id"], round_end,
-                pre_submit_guard=lambda: _fresh_authority_permit(
-                    active_window, start_price, start_chainlink_price,
-                    submit_book_side, side,
-                    signal_observer=signal_epoch.observe))
+                pre_submit_guard=pre_submit_guard)
             if ok:
                 round_exposure += entry_ceiling
                 # Shared with durable restart recovery. LIVE and default PAPER

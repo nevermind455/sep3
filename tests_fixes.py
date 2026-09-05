@@ -893,7 +893,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   allow_signal_flips=False,
                                   minority_rule=False,
                                   price_fallback=False,
-                                  partial_signals=False):
+                                  partial_signals=False,
+                                  must_fire=False):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1012,6 +1013,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                 price_fallback)
         replace(main_bot.config, "PHASE2_MULTI_SIGNAL", False)
         replace(main_bot.config, "PHASE2_PARTIAL_SIGNALS", partial_signals)
+        replace(main_bot.config, "PHASE2_MUST_FIRE", must_fire)
+        replace(main_bot.config, "LIVE_ALLOW_SIGNAL_FLIPS", allow_signal_flips)
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(asyncio.TimeoutError):
@@ -1052,6 +1055,29 @@ async def t_restart_held_up_blocks_phase2_down_in_paper_and_live():
           live_calls and live_calls[0][1] is None, str(live_calls))
     check("live restart blocks phase-2 DOWN complement before liquidity/submit",
           live["orders"] == 0 and live["probes"] == 0, str(live))
+
+
+async def t_phase2_must_fire_places_instead_of_skipping():
+    complement = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: {"11"},
+        must_fire=True)
+    check("must-fire places the complement instead of holding the other leg",
+          complement["order_sides"] == ["DOWN"] and complement["orders"] == 1,
+          str(complement))
+
+    live_complement = await _drive_phase2_with_hold(
+        execution_mode="LIVE", held_provider=lambda *_a: {"11"},
+        must_fire=True)
+    check("must-fire places the live complement instead of skipping",
+          live_complement["order_sides"] == ["DOWN"]
+          and live_complement["orders"] == 1, str(live_complement))
+
+    flipped = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("DOWN", "UP"), must_fire=True)
+    check("must-fire retargets a validation flip and still places",
+          flipped["order_sides"] == ["UP"] and flipped["orders"] == 1,
+          str(flipped))
 
 
 async def t_phase2_price_signal_is_the_only_order_side_authority():
@@ -1382,6 +1408,13 @@ def t_signal_flip_config_requires_phase_two():
                          PHASE2_ENABLED="1") is None)
     check("signal flips remain off by default",
           _reload_config(PAPER_ALLOW_SIGNAL_FLIPS="0") is None)
+
+    parked_fire = _reload_config(PHASE2_MUST_FIRE="1", PHASE2_ENABLED="0")
+    check("must-fire requires PHASE2_ENABLED=1",
+          parked_fire is not None and "PHASE2_ENABLED=1" in parked_fire,
+          str(parked_fire))
+    check("must-fire configuration loads with phase 2",
+          _reload_config(PHASE2_MUST_FIRE="1", PHASE2_ENABLED="1") is None)
 
 
 def t_round_exposure_follows_the_enabled_phases():
