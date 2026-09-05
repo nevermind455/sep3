@@ -142,12 +142,22 @@ chmod 600 .env
 # edit .env, add credentials, remove the shebang comments above them
 ```
 
-The template narrows the entry envelope on a distant host (`MAX_BUY_PRICE=0.85`,
-`ORDERBOOK_MAX_AGE_SECONDS=3.0`, `ROUND_PREPARE_LEAD_SECONDS=45`) so the bot
-refuses more marginal fills rather than accepting them at worse prices than a
-home connection would. It does not enable any hidden edge - it trades a few
-missed fills for far fewer bad fills, which is the right direction on a host
-whose RTT is measured in hundreds of milliseconds.
+The template does two things:
+
+- **Narrows the entry envelope** (`MAX_BUY_PRICE=0.85`,
+  `ORDERBOOK_MAX_AGE_SECONDS=3.0`, `ROUND_PREPARE_LEAD_SECONDS=45`) so the
+  bot refuses more marginal fills rather than accepting them at worse
+  prices than a home connection would.
+- **Widens the signal-generation tolerances** just enough for a slower
+  websocket delivery cadence, so "signal is late" does not become "no
+  signal" (`BTC_STALE_AFTER=5.0`, `BOUNDARY_BACKFILL_AFTER=8`,
+  `SKIP_JOINED_ROUND=1`). If your VPS logs show frequent
+  `waiting for price...` or `Opening print could not be recovered`,
+  these are the knobs; see the notes inside the template.
+
+It does not enable any hidden edge - it trades a few missed fills for far
+fewer bad fills, and accepts a slightly older Binance print as still
+usable when the socket is a beat slower than at home.
 
 Run PAPER for at least a day on the VPS with these settings before
 promoting to LIVE. Compare `paper_trade_log.csv` from the VPS against
