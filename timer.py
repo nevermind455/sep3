@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
+import http_pool
 
 ET = ZoneInfo("America/New_York")
 
@@ -156,7 +156,7 @@ def check_clock(host: str, max_drift_s: float = 2.0, *, cache_s: float = 30.0,
     offset = None
     try:
         before = time.time()
-        response = requests.get(f"{host.rstrip('/')}/time", timeout=timeout)
+        response = http_pool.get(f"{host.rstrip('/')}/time", timeout=timeout)
         response.raise_for_status()
         after = time.time()
         raw = response.json()

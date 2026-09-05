@@ -486,12 +486,12 @@ def t_clock_offset_aligns_round_identity_to_clob():
     import timer
     timer.reset_clock_cache()
     server_ahead = 2.363
-    orig = timer.requests.get
+    orig = timer.http_pool.get
 
     def fake_get(*_a, **_k):
         return _ClockResp(time.time() + server_ahead)
 
-    timer.requests.get = fake_get
+    timer.http_pool.get = fake_get
     try:
         ok, detail, drift = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("measured drift beyond 2s is not within live tolerance",
@@ -511,7 +511,7 @@ def t_clock_offset_aligns_round_identity_to_clob():
         check("seconds_left uses the supplied sample",
               timer.seconds_left(explicit) == 283)
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
     check("reset clears the measured offset",
           not timer.clock_measured() and timer.clock_offset() == 0.0)
@@ -524,12 +524,12 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
     from feeds.binance import BinanceTradeFeed
 
     timer.reset_clock_cache()
-    orig = timer.requests.get
+    orig = timer.http_pool.get
     orig_price = price_ws.latest_price
     orig_mono = price_ws.latest_price_mono
     orig_ts = price_ws.latest_price_ts_ms
     orig_id = price_ws.latest_trade_id
-    timer.requests.get = lambda *_a, **_k: _ClockResp(time.time() + 3.5)
+    timer.http_pool.get = lambda *_a, **_k: _ClockResp(time.time() + 3.5)
     try:
         timer.check_clock("https://clob.example", 2.0, cache_s=0)
         trade_ms = int(time.time() * 1000) + 3500
@@ -557,7 +557,7 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
         check("fresh_snapshot does not treat CLOB/Binance skew as local staleness",
               fresh_past == 64124.00 and ts_past == past_ms, str((fresh_past, ts_past)))
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
         price_ws.latest_price = orig_price
         price_ws.latest_price_mono = orig_mono
@@ -568,19 +568,19 @@ def t_binance_and_fresh_snapshot_follow_clob_time():
 def t_clock_check_failure_does_not_clear_last_offset():
     import timer
     timer.reset_clock_cache()
-    orig = timer.requests.get
-    timer.requests.get = lambda *_a, **_k: _ClockResp(time.time() + 0.05)
+    orig = timer.http_pool.get
+    timer.http_pool.get = lambda *_a, **_k: _ClockResp(time.time() + 0.05)
     try:
         ok, _detail, drift = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("small drift is within tolerance", ok is True, str(drift))
         stored = timer.clock_offset()
-        timer.requests.get = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("down"))
+        timer.http_pool.get = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("down"))
         ok2, detail2, drift2 = timer.check_clock("https://clob.example", 2.0, cache_s=0)
         check("network failure is fail-closed", ok2 is False and drift2 is None, detail2)
         check("last good offset is kept after a failed refresh",
               timer.clock_measured() and abs(timer.clock_offset() - stored) < 1e-9)
     finally:
-        timer.requests.get = orig
+        timer.http_pool.get = orig
         timer.reset_clock_cache()
 
 
@@ -588,14 +588,14 @@ def t_clock_cache_is_invalidated_by_a_local_wall_clock_jump():
     import timer
 
     timer.reset_clock_cache()
-    original = timer.requests.get
+    original = timer.http_pool.get
     calls = []
 
     def fake_get(*_a, **_k):
         calls.append(True)
         return _ClockResp(time.time())
 
-    timer.requests.get = fake_get
+    timer.http_pool.get = fake_get
     try:
         timer.check_clock("https://clob.example", 2.0, cache_s=30)
         timer.check_clock("https://clob.example", 2.0, cache_s=30)
@@ -608,7 +608,7 @@ def t_clock_cache_is_invalidated_by_a_local_wall_clock_jump():
         check("wall-clock jump forces an immediate CLOB recheck",
               len(calls) == 2, str(calls))
     finally:
-        timer.requests.get = original
+        timer.http_pool.get = original
         timer.reset_clock_cache()
 
 

@@ -908,7 +908,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: removed a duplicate clock_offset() definition
     # that silently overrode a docless twin defined earlier. Runtime
     # unchanged - Python already used the surviving definition.
-    "timer.py": "8c382dbd962ffa3f14e35fc3b35d9a4720dd8463e35bcce62d2b1fdbdfd946ce",
+    # Re-approved 2026-09-05: check_clock() reads /time through http_pool
+    # instead of a fresh requests.get, cutting the TCP+TLS handshake out
+    # of every drift sample so the offset wall() applies is measured on a
+    # pooled steady-state RTT rather than a first-connection round trip.
+    "timer.py": "5d7984c6c81dd0422b161727d695b60cdef6e3b669bcd2f18d26004e4b10e2be",
 }
 
 

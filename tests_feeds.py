@@ -1611,7 +1611,13 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # that silently overrode a docless twin defined earlier in the module.
     # Kept the version with the docstring; runtime behaviour is unchanged
     # because Python was already using the later definition.
-    "timer.py": "8c382dbd962ffa3f14e35fc3b35d9a4720dd8463e35bcce62d2b1fdbdfd946ce",
+    # Re-approved 2026-09-05: check_clock() now GETs /time through http_pool
+    # instead of a fresh requests.get, so it reuses the pooled TCP+TLS
+    # connection each call. On a distant VPS the ~200 ms handshake was
+    # bloating the drift estimate that wall() depends on; the pooled path
+    # measures a steady-state RTT. Callers unchanged; tests that stubbed
+    # timer.requests.get were repointed to timer.http_pool.get.
+    "timer.py": "5d7984c6c81dd0422b161727d695b60cdef6e3b669bcd2f18d26004e4b10e2be",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
