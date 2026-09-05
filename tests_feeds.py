@@ -1559,7 +1559,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # holds). Every guard (ASK_MIN < ASK_MAX < 1.0, ASK_MAX <= MAX_BUY_PRICE,
     # MIN_HELD_COST >= 0, LOSS_CAP >= 0, MAX_HEDGE_COST > 0) is unchanged;
     # decision code in cheap_hedge.py is untouched.
-    "config.py": "5842b04a47ca1dbefa851853b3d29a58c29c3196f092eacfc578e16a82641f59",
+    # Re-approved 2026-09-05: added SIGNAL_PRICE_FALLBACK_COMBINED (off by
+    # default). SIG PRICE stays authoritative whenever usable; the
+    # BOOK+CHAINLINK consensus may authorize only in its absence. Mutually
+    # exclusive with SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL.
+    # Re-approved 2026-09-05: CHEAP_HEDGE_LOSS_CAP replaced by
+    # CHEAP_HEDGE_MIN_LOCKED_EDGE - the hedge now refuses unless the finished
+    # pair locks that much profit per share after both legs' fees, and sizes
+    # toward a full match. Range-checked to [0, 1).
+    "config.py": "95e96e8d51c309fb046d4afedaacf9f2049d7de01dd450621891da52c0840740",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -1578,7 +1586,15 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # T-60..T-20 may place 1-2 FOKs of the red 0.80-0.88 favorite; normal
     # entries still use MIN_SECONDS_TO_EXPIRY.
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
-    "main_bot.py": "aa4ea3b48aba541ab14bfc9817d66406695083f2050afd67866d53c1bedc16ca",
+    # Re-approved 2026-09-05: minority mode now revalidates its configured
+    # three-signal authority at every gate (including executor commit), anchors
+    # restart epochs after that authority is observed, and keeps an explicitly
+    # partial Chainlink signal optional through final submission checks.
+    # Re-approved 2026-09-05: phase 2 resolves its side through
+    # _authority_side in every mode and revalidates it at executor commit via
+    # _fresh_authority_permit. Normal mode delegates to _fresh_price_permit
+    # unchanged. Restart anchoring moved after the first authority observation.
+    "main_bot.py": "dbe668c3fa9c5c511d4041277e5d48e4a8cb942504f907dff324bc23dc2c705f",
     # Re-approved 2026-08-25: discovery fails closed unless Gamma declares
     # the exact BTC / 5m / enabled 60-second TWAP contract used by the bot.
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
@@ -1610,7 +1626,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Re-approved 2026-09-04: removed a duplicate "taker_delay" dict key
     # (the second-defined shadowed the first) and dropped a redundant
     # bool() coercion. Cleanup only; no decision-path change.
-    "polymarket_trade.py": "ad333edf2a51b7b10d12e619083b7819dc208ba841f702d97ff934f65d352671",
+    # Re-approved 2026-09-05: an explicit cheap_hedge order type uses only
+    # CHEAP_HEDGE_ASK_MIN..ASK_MAX. Normal entries still enforce the account
+    # MIN_BUY_PRICE, so reversal insurance can trade its intended underdog
+    # band without weakening the ordinary entry floor.
+    "polymarket_trade.py": "83ab4643befdb2629d061b240462be17c8961c7d45267b9219d0c9f4391e7952",
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only; git
     # diff reports no semantic change.
     "price_ws.py": "c9c501942855e5448b7659dc1fac333a729cbaedbefb95a07c24fee02c13ad25",

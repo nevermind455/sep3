@@ -7,7 +7,7 @@ creates a signature, or calls an order/cancel/account endpoint.
 The simulator models the live bot's FOK market BUY:
 
 * fetch the selected outcome's public order book at submission time;
-* walk asks from best to worst, enforcing ``MIN_BUY_PRICE`` and ``MAX_BUY_PRICE``;
+* walk asks from best to worst, enforcing the configured order price band;
 * fill the whole dollar amount or reject it (no partial FOK fills);
 * enforce the venue-reported minimum order size;
 * apply the venue's public fee curve at every consumed price level;
@@ -988,7 +988,8 @@ class PaperBroker:
                     window_end: float | None = None,
                     max_price: float | None = None, *,
                     pre_submit_guard=None,
-                    min_expiry: float | None = None) -> bool:
+                    min_expiry: float | None = None,
+                    cheap_hedge: bool = False) -> bool:
         """Run one simulated FOK; reject concurrent duplicate submissions.
 
         `max_price` caps this order only. A caller trading a price band needs
@@ -997,6 +998,8 @@ class PaperBroker:
         An optional `pre_submit_guard` must return literal ``True`` after the
         modeled delay and quote, immediately before the durable paper fill.
         `min_expiry` may lower the last-minute floor when late trim is on.
+        `cheap_hedge=True` selects its dedicated underdog band without lowering
+        the normal entry floor for any other order.
         """
         if not self._execution_lock.acquire(blocking=False):
             return self._reject(side, amount, "another paper order is already in flight")
@@ -1004,7 +1007,8 @@ class PaperBroker:
             return self._place_trade(side, amount, up_token_id, down_token_id,
                                      condition_id, window_end, max_price,
                                      pre_submit_guard=pre_submit_guard,
-                                     min_expiry=min_expiry)
+                                     min_expiry=min_expiry,
+                                     cheap_hedge=cheap_hedge)
         finally:
             self._execution_lock.release()
 
@@ -1015,7 +1019,8 @@ class PaperBroker:
                      window_end: float | None = None,
                      max_price: float | None = None, *,
                      pre_submit_guard=None,
-                     min_expiry: float | None = None) -> bool:
+                     min_expiry: float | None = None,
+                     cheap_hedge: bool = False) -> bool:
         side = str(side or "").upper()
         if side not in ("UP", "DOWN"):
             return self._reject(side, amount, "invalid side")
@@ -1105,23 +1110,38 @@ class PaperBroker:
             if spread > Decimal(str(self.max_spread)):
                 raise PaperRejected(
                     f"spread {spread:.6f} exceeds paper limit {self.max_spread:.6f}")
+            if type(cheap_hedge) is not bool:
+                raise PaperRejected("cheap_hedge must be a boolean")
             # An order-level cap may tighten the account ceiling but never
             # loosen it: a caller cannot buy above what the account allows.
             cap = self.max_buy_price
-            if max_price is not None:
-                cap = min(cap, float(max_price))
-                if cap <= self.min_buy_price:
+            floor = self.min_buy_price
+            if cheap_hedge:
+                import config
+                if not config.CHEAP_HEDGE_ENABLED:
                     raise PaperRejected(
-                        f"order price cap {cap} is at or below the floor "
-                        f"{self.min_buy_price}")
+                        "cheap hedge price band requested while disabled")
+                # Reversal insurance is intentionally cheaper than an entry.
+                # Make that exception opt-in for this order only so ordinary
+                # phase-2 and trim buys still enforce the account floor.
+                cap = min(cap, float(config.CHEAP_HEDGE_ASK_MAX))
+                floor = float(config.CHEAP_HEDGE_ASK_MIN)
+            if max_price is not None:
+                try:
+                    cap = min(cap, float(max_price))
+                except (TypeError, ValueError) as exc:
+                    raise PaperRejected("invalid order price cap") from exc
+            if (not math.isfinite(cap) or not math.isfinite(floor)
+                    or not 0 <= floor < cap < 1):
+                raise PaperRejected(
+                    f"order price cap {cap} is at or below the floor {floor}")
             spend = size_to_venue_minimum(amount, book, rules, cap)
             if spend > Decimal(str(amount)):
                 print(
                     f"[PAPER] Sizing ${float(amount):.2f} up to ${float(spend):.2f} "
                     f"to meet the venue minimum"
                 )
-            quote = estimate_fok(book, spend, cap, rules,
-                                 min_price=self.min_buy_price)
+            quote = estimate_fok(book, spend, cap, rules, min_price=floor)
             if timer.unix() >= cutoff:
                 raise PaperRejected("paper quote reached the round cutoff")
             with self._lock:

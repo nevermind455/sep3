@@ -1,19 +1,34 @@
 """Cheap-hedge decision. Pure: no I/O, no orders.
 
-One clip per round, fires only when we have already built a real position on
-one side and the UNDERDOG's ask sits inside a narrow cheap band. The point is
-insurance against a late reversal - if the round flips, the underdog pays $1
-per share and the cheap shares recover most of the exposed loss. When the
-round settles the way we bet, the small hedge cost was the premium.
+One clip per round. Fires only when buying the UNDERDOG completes a pair
+that is PROVABLY PROFITABLE after both legs' fees - never as a speculative
+premium. A matched UP+DOWN pair redeems for exactly $1.00 whichever way the
+round settles, so if the all-in cost of both legs is below $1.00 the matched
+portion is locked profit regardless of outcome.
+
+That is the whole test:
+
+    locked_per_pair = 1.00 - (held_all_in_per_share
+                              + underdog_ask
+                              + underdog_fee_per_share)
+
+and the hedge fires only when ``locked_per_pair >= min_locked_edge``.
+
+A raw price band cannot express this. At a 0.80 entry an underdog at 0.18
+is roughly break-even after fees; at a 0.60 entry the same 0.18 is a large
+locked profit; at a 0.90 entry it is a guaranteed loss. The band survives
+only as a loose sanity bound on absurd quotes - the locked-edge test is the
+real gate.
+
+Sizing targets a FULL match (one underdog share per held share), because
+every matched pair carries the same locked edge and leaving shares unmatched
+just leaves that profit on the table. ``max_hedge_cost`` is the spend ceiling
+when a full match would cost more than the operator wants to commit.
 
 Deliberately independent of LATE_TRIM. That module fires later (T-60..T-20),
-buys the FAVORITE (0.80-0.88), and closes a hole that already exists. This
-module fires earlier (T-180..T-60), buys the UNDERDOG (0.10-0.15), and pays
-a small premium for a large payout if the round reverses.
-
-Only insures a "large" position: MIN_HELD_COST enforces that the exposed
-side is worth insuring in the first place. On a small position the insurance
-premium eats too much of the win when we are right.
+buys the FAVORITE, and closes a hole that already exists. This one fires
+anywhere before its cutoff, buys the UNDERDOG, and only when the finished
+pair cannot lose.
 """
 from __future__ import annotations
 
@@ -44,7 +59,8 @@ def evaluate_cheap_hedge(
     ask_min: float,
     ask_max: float,
     min_held_cost: float,
-    loss_cap: float,
+    fee_rate: float,
+    min_locked_edge: float,
     max_hedge_cost: float,
     current_traded_side: str | None,
     require_strong_signal: bool,
@@ -57,6 +73,8 @@ def evaluate_cheap_hedge(
     """
     up_c = _finite(up_cost) or 0.0
     down_c = _finite(down_cost) or 0.0
+    up_sh = _finite(up_shares) or 0.0
+    down_sh = _finite(down_shares) or 0.0
 
     out: dict[str, Any] = {
         "action": "skip",
@@ -68,6 +86,9 @@ def evaluate_cheap_hedge(
         "shares": None,
         "held_side": None,
         "held_cost": None,
+        "held_shares": None,
+        "held_all_in": None,
+        "locked_per_pair": None,
         "hedge_cost_uncapped": None,
     }
 
@@ -89,13 +110,11 @@ def evaluate_cheap_hedge(
     # exists for; the caller has already paid a pair overround and reversal
     # protection is not the right tool for that. Refuse cleanly.
     if up_c > down_c:
-        held_side = "UP"
-        held_cost = up_c
+        held_side, held_cost, held_shares = "UP", up_c, up_sh
         hedge_side = "DOWN"
         hedge_ask = _finite(down_ask)
     elif down_c > up_c:
-        held_side = "DOWN"
-        held_cost = down_c
+        held_side, held_cost, held_shares = "DOWN", down_c, down_sh
         hedge_side = "UP"
         hedge_ask = _finite(up_ask)
     else:
@@ -104,6 +123,7 @@ def evaluate_cheap_hedge(
 
     out["held_side"] = held_side
     out["held_cost"] = held_cost
+    out["held_shares"] = held_shares
 
     if held_cost < min_held_cost:
         out["reason"] = (
@@ -143,28 +163,34 @@ def evaluate_cheap_hedge(
             )
             return out
 
-    # Sizing: cap the reversal loss at LOSS_CAP.
-    # We need enough hedge shares to recover (held_cost - loss_cap) when the
-    # underdog pays $1. Each hedge share costs `hedge_ask` and pays $1, so
-    # its NET recovery per share is (1 - hedge_ask). shares_needed follows.
-    target_recovery = held_cost - loss_cap
-    if target_recovery <= 0.0:
+    # ---- the real gate: is the finished pair profitable after both fees? ----
+    # `held_cost` is the ledger's all-in figure (notional + fee already paid),
+    # so dividing by shares gives what each held share truly cost us. A
+    # matched pair redeems exactly $1.00, so anything the two legs cost below
+    # that is locked profit no matter which outcome wins.
+    if held_shares <= 0.0:
+        out["reason"] = "held side has no shares to match"
+        return out
+    held_all_in = held_cost / held_shares
+    out["held_all_in"] = held_all_in
+
+    hedge_fee_per_share = fee_rate * hedge_ask * (1.0 - hedge_ask)
+    locked = 1.0 - (held_all_in + hedge_ask + hedge_fee_per_share)
+    out["locked_per_pair"] = locked
+    if locked < min_locked_edge:
         out["reason"] = (
-            f"held cost ${held_cost:.2f} already within loss cap "
-            f"${loss_cap:.2f}"
+            f"pair locks {locked:+.4f}/share (held all-in {held_all_in:.4f} "
+            f"+ ask {hedge_ask:.4f} + fee {hedge_fee_per_share:.4f}); "
+            f"needs {min_locked_edge:.4f}"
         )
         return out
-    denom = 1.0 - hedge_ask
-    if denom <= 0.0:
-        out["reason"] = "underdog ask >= 1.0; hedge would not recover anything"
-        return out
-    shares_needed = target_recovery / denom
-    hedge_cost_uncapped = shares_needed * hedge_ask
-    out["hedge_cost_uncapped"] = hedge_cost_uncapped
 
-    # Cap the hedge itself so a wide gap between held_cost and loss_cap
-    # doesn't ask for a hedge bigger than the operator will spend. Accepting
-    # a partial hedge is better than skipping the insurance entirely.
+    # ---- sizing: target a FULL match ----------------------------------------
+    # Every matched pair carries the same locked edge, so a partial match just
+    # leaves guaranteed profit unclaimed. Buy one underdog share per held
+    # share, and let max_hedge_cost be the only thing that trims it.
+    hedge_cost_uncapped = held_shares * hedge_ask
+    out["hedge_cost_uncapped"] = hedge_cost_uncapped
     hedge_cost = min(hedge_cost_uncapped, max_hedge_cost)
     if hedge_cost <= 0.0:
         out["reason"] = "hedge cost non-positive"
@@ -173,7 +199,7 @@ def evaluate_cheap_hedge(
     out.update({
         "action": "buy",
         "side": hedge_side,
-        "reason": "hedge",
+        "reason": "locked pair",
         "amount": hedge_cost,
         "max_price": ask_max,
         "shares": hedge_cost / hedge_ask,

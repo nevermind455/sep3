@@ -1082,12 +1082,18 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
                     if pos.settled or pos.condition_id != condition:
                         continue
                     tid_s = str(tid)
+                    # BUGFIX: pos.cost is ALREADY all-in - the ledger does
+                    # `pos.cost += sh * px + f` and tracks pos.fees as the fee
+                    # component inside it (see Position.avg_price, which
+                    # subtracts fees back out). Adding pos.fees here counted
+                    # every fee twice, inflating held cost by ~4% and making
+                    # the hedge size against a position larger than reality.
                     if tid_s == up_token:
                         up_shares += float(pos.shares or 0.0)
-                        up_cost += float(pos.cost or 0.0) + float(pos.fees or 0.0)
+                        up_cost += float(pos.cost or 0.0)
                     elif tid_s == down_token:
                         down_shares += float(pos.shares or 0.0)
-                        down_cost += float(pos.cost or 0.0) + float(pos.fees or 0.0)
+                        down_cost += float(pos.cost or 0.0)
 
             up_view = hub.book.view(up_token)
             down_view = hub.book.view(down_token)
@@ -1095,11 +1101,10 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
             down_ask = getattr(down_view, "best_ask", None) if down_view else None
 
             # The direction the strategy is currently trading. Sourced from
-            # state.decision, which the probe now updates from BOTH
-            # strategy.final_decision AND strategy.minority_decision so
-            # SIGNAL_MINORITY_RULE reflects the true traded side (fixing
-            # the earlier "any signal disagrees" bug that refused every
-            # legit hedge under minority rule).
+            # state.decision, which the probe updates from main_bot's final
+            # authority resolver. It therefore reflects SIG PRICE, the
+            # explicit BOOK+CHAINLINK fallback while price is absent, or the
+            # configured minority experiment instead of a diagnostic vote.
             current_traded_side = None
             try:
                 from dashboard import probe as _probe
@@ -1123,7 +1128,8 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
                 ask_min=config.CHEAP_HEDGE_ASK_MIN,
                 ask_max=config.CHEAP_HEDGE_ASK_MAX,
                 min_held_cost=config.CHEAP_HEDGE_MIN_HELD_COST,
-                loss_cap=config.CHEAP_HEDGE_LOSS_CAP,
+                fee_rate=config.TAKER_FEE_RATE,
+                min_locked_edge=config.CHEAP_HEDGE_MIN_LOCKED_EDGE,
                 max_hedge_cost=config.CHEAP_HEDGE_MAX_HEDGE_COST,
                 current_traded_side=current_traded_side,
                 require_strong_signal=config.CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL,
@@ -1151,10 +1157,12 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
                 status = (skip_reason if skip_reason
                           else ("fires" if decision["action"] == "buy"
                                 else decision["reason"]))
+                locked = decision.get("locked_per_pair")
+                locked_txt = (f"lock {locked:+.4f}/sh"
+                              if locked is not None else "lock --")
                 on_event("cheaphedge",
                          f"watch T-{remaining:.0f} | held {held_txt} | "
-                         f"udog {udog_txt} | traded {current_traded_side or '-'}"
-                         f" | {status}",
+                         f"udog {udog_txt} | {locked_txt} | {status}",
                          "info")
 
             if skip_reason or decision["action"] != "buy":
@@ -1166,16 +1174,17 @@ async def _cheap_hedge_loop(hub, ledger, stop, on_event) -> None:
             max_price = float(decision["max_price"] or config.CHEAP_HEDGE_ASK_MAX)
             on_event("cheaphedge",
                      f"{side} ${amount:.2f} @<={max_price:.2f} "
-                     f"(held {decision['held_side']} ${decision['held_cost']:.2f}, "
+                     f"(held {decision['held_side']} {decision['held_shares']:.2f}sh "
+                     f"all-in {decision['held_all_in']:.4f}, "
                      f"underdog ask {decision['ask']:.3f}, "
-                     f"target loss cap ${config.CHEAP_HEDGE_LOSS_CAP:.2f})",
+                     f"locks {decision['locked_per_pair']:+.4f}/pair)",
                      "warn")
             # place_trade is the same entry the strategy loop uses; patched
             # for paper by install_paper_execution, real for live. It handles
             # its own preflight, guard and back-off.
             ok = await asyncio.to_thread(
                 main_bot.place_trade, side, amount, up_token, down_token,
-                condition, window + 300, max_price)
+                condition, window + 300, max_price, cheap_hedge=True)
             if ok:
                 fired.add(key)
                 fail_streak.pop(key, None)
@@ -1353,6 +1362,20 @@ def _ms(v):
     return "--" if v is None else f"{v:.0f}ms"
 
 
+def _handle_dashboard_keys(keys, renderer, stop) -> bool:
+    """Apply queued dashboard controls; return True when shutdown was asked."""
+    import main_bot
+
+    for ch in keys.pop():
+        if ch in ("q", "Q", "\x03", "\r", "\n"):
+            stop.set()
+            main_bot.stop_event.set()
+            return True
+        if ch in ("r", "R", "\x0c"):
+            renderer.repaint()
+    return False
+
+
 async def _dashboard(hub, cfg, agreement, reconciler, stop, *, ledger=None,
                      settler=None, broker=None) -> None:
     try:
@@ -1387,7 +1410,8 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
                            settler=None, broker=None) -> None:
     """Attach the terminal dashboard if it is present in this tree."""
     try:
-        from dashboard import TerminalState, build, glyphs, make_renderer, snapshot
+        from dashboard import (Keys, TerminalState, build, glyphs, make_renderer,
+                               snapshot)
         from dashboard import probe
     except Exception as exc:
         print(f"[FEEDS] dashboard unavailable: {exc}")
@@ -1400,6 +1424,7 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
         state.event("DASH", f"asyncio hook attach failed: {type(exc).__name__}: {exc}",
                     "warn")
     renderer = make_renderer(real_stdout)
+    keys = Keys()
     _latency_next_emit = 0.0
     _LATENCY_EMIT_EVERY_S = 60.0
     g = glyphs()
@@ -1407,8 +1432,10 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
     import config
     import main_bot
     import timer
-    with renderer:
+    with keys, renderer:
         while not stop.is_set():
+            if _handle_dashboard_keys(keys, renderer, stop):
+                break
             sampled_wall = timer.unix()
             round_window = timer.window_start(sampled_wall)
             state.set_round_context(
@@ -1575,6 +1602,8 @@ async def _dashboard_inner(hub, cfg, agreement, reconciler, stop, *, ledger=None
                                      f"{type(exc).__name__}: {exc}",
                                      traceback.format_exc())
             await asyncio.sleep(1 / 6)
+    if keys.last_error:
+        on_event("dashboard", keys.last_error, "warn")
 
 
 async def health_only() -> None:

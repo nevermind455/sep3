@@ -463,10 +463,101 @@ def bug7_l2_creds_retry_timeout():
             setattr(obj, name, value)
 
 
+def bug8_cheap_hedge_price_band():
+    """Cheap insurance needs its own floor without weakening normal buys."""
+    print("\nBUG 8 - cheap hedge cap was below the shared entry floor")
+    import polymarket_trade as live
+
+    feeds_source = (ROOT / "run_feeds.py").read_text(encoding="utf-8")
+    check("cheap-hedge loop opts into the dedicated execution band",
+          "condition, window + 300, max_price, cheap_hedge=True)" in feeds_source)
+
+    class Client:
+        def get_clob_market_info(self, _condition):
+            return {}
+
+        def create_market_order(self, order, options=None):
+            return (order, options)
+
+        def post_order(self, _signed, _order_type):
+            return {
+                "success": True, "orderID": "cheap-hedge", "status": "matched",
+                "tradeIDs": ["cheap-hedge-trade"],
+                "makingAmount": "2000000", "takingAmount": "13000000",
+            }
+
+    saved = []
+
+    def replace(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    seen = []
+
+    def validate(_token, _amount, cap, _spread, *, min_price):
+        seen.append((cap, min_price))
+        return ([{"price": "0.14", "size": "100"}],
+                [{"price": "0.15", "size": "100"}])
+
+    try:
+        replace(live, "_live_disabled", False)
+        replace(live, "_journal_fault", None)
+        replace(live, "_ambiguous_condition", None)
+        replace(live, "_ambiguous_until", 0.0)
+        replace(live, "_ambiguous_tokens", set())
+        replace(live, "_ambiguous_all_tokens", False)
+        replace(live, "_order_observer", lambda _receipt: True)
+        replace(live, "_validate_round_end", lambda end: float(end))
+        replace(live, "_validate_market_mapping", lambda *_a, **_k: {
+            "minimum": live.Decimal("1"),
+            "tick": live.Decimal("0.01"),
+            "neg_risk": False,
+            "fee_rate": live.Decimal("0.07"),
+            "fee_exponent": 1,
+        })
+        replace(live.orderbook, "validate_buy_liquidity", validate)
+        replace(live, "_read_balance", lambda _client: {
+            "balance": 100.0, "allowance": 100.0,
+        })
+        replace(live, "_get_client", lambda: Client())
+        replace(live, "MarketOrderArgs", lambda **kw: kw)
+        replace(live, "PartialCreateOrderOptions", lambda **kw: kw)
+        replace(live, "Side", type("Side", (), {"BUY": "BUY"}))
+        replace(live, "OrderType", type("OrderType", (), {"FOK": "FOK"}))
+        replace(live.config, "TICK_SIZE", None)
+        replace(live.config, "NEG_RISK", None)
+        replace(live.config, "MAX_BUY_PRICE", 0.80)
+        replace(live.config, "MIN_BUY_PRICE", 0.30)
+        replace(live.config, "MAX_ALLOWED_SPREAD", 0.25)
+        replace(live.config, "CHEAP_HEDGE_ENABLED", True)
+        replace(live.config, "CHEAP_HEDGE_ASK_MIN", 0.10)
+        replace(live.config, "CHEAP_HEDGE_ASK_MAX", 0.20)
+        replace(live.time, "sleep", lambda _seconds: None)
+
+        condition = "0x" + "b" * 64
+        normal = live.place_trade(
+            "DOWN", 2.0, "11", "12", condition, 300.0, 0.20)
+        check("ordinary live order remains blocked below MIN_BUY_PRICE",
+              normal is False and seen == []
+              and "floor" in (live.last_order_error or "").lower(),
+              f"result={normal} seen={seen} error={live.last_order_error}")
+
+        hedged = live.place_trade(
+            "DOWN", 2.0, "11", "12", condition, 300.0, 0.20,
+            cheap_hedge=True)
+        check("live cheap hedge reaches liquidity with its 0.10-0.20 band",
+              hedged is True and seen == [(0.2, 0.1)],
+              f"result={hedged} seen={seen} error={live.last_order_error}")
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+
+
 def main():
     for fn in (bug1_resolver, bug2_clustered_se, bug3_exposure_ceiling,
                bug4_binance_strike, bug5_vote_label,
-               bug6_live_pre_submit_guard, bug7_l2_creds_retry_timeout):
+               bug6_live_pre_submit_guard, bug7_l2_creds_retry_timeout,
+               bug8_cheap_hedge_price_band):
         try:
             fn()
         except Exception as exc:                       # per-test isolation

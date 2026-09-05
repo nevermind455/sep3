@@ -402,14 +402,15 @@ def t_dynamic_v2_fee_curve_and_missing_fee_rejection():
 
 
 def _broker(tmp, *, balance=100, selected_book=None, selected_rules=None,
-            context=None):
+            context=None, min_buy_price=0.0, max_buy_price=0.99):
     tmp = pathlib.Path(tmp)
     ledger = Ledger(path=str(tmp / "paper_ledger.json"))
     ctx = context or {"condition_id": "cond", "up_token_id": "up",
                       "down_token_id": "down"}
     broker = PaperBroker(
         ledger, market_context=lambda: dict(ctx), host="https://public.invalid",
-        max_buy_price=.99, start_balance=balance,
+        max_buy_price=max_buy_price, min_buy_price=min_buy_price,
+        start_balance=balance,
         account_path=tmp / "paper_account.json",
         audit_path=tmp / "paper_orders.jsonl",
         book_fetch=lambda token: selected_book or book(token),
@@ -417,6 +418,43 @@ def _broker(tmp, *, balance=100, selected_book=None, selected_rules=None,
         min_seconds_to_expiry=0, trade_window_seconds=300,
     )
     return broker
+
+
+def t_cheap_hedge_has_an_explicit_paper_price_band():
+    """The 0.10-0.20 hedge must not lower the floor for normal entries."""
+    import config
+
+    underdog = BookSnapshot(
+        "down", ((D("0.15"), D("100")),), min_order_size=D("5"),
+        tick_size=D("0.01"), timestamp=str(int(time.time() * 1000)),
+        book_hash="hedge", received_wall=time.time(), best_bid=D("0.14"))
+    context = {"condition_id": "cond", "up_token_id": "up",
+               "down_token_id": "down"}
+    original = (config.CHEAP_HEDGE_ENABLED, config.CHEAP_HEDGE_ASK_MIN,
+                config.CHEAP_HEDGE_ASK_MAX)
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(
+            tmp, selected_book=underdog, selected_rules=rules(minimum=5),
+            context=context, min_buy_price=0.30, max_buy_price=0.80)
+        try:
+            config.CHEAP_HEDGE_ENABLED = True
+            config.CHEAP_HEDGE_ASK_MIN = 0.10
+            config.CHEAP_HEDGE_ASK_MAX = 0.20
+            normal = broker.place_trade(
+                "DOWN", 2.0, "up", "down", "cond", round_end(), 0.20)
+            check("normal paper entry cannot bypass the account floor",
+                  normal is False and "floor 0.3" in (broker.last_error or ""),
+                  str(broker.last_error))
+            hedged = broker.place_trade(
+                "DOWN", 2.0, "up", "down", "cond", round_end(), 0.20,
+                cheap_hedge=True)
+            check("paper cheap hedge can fill inside its dedicated band",
+                  hedged is True and broker.last_fill is not None
+                  and approx(broker.last_fill["worst_price"], 0.15),
+                  str((hedged, broker.last_error, broker.last_fill)))
+        finally:
+            (config.CHEAP_HEDGE_ENABLED, config.CHEAP_HEDGE_ASK_MIN,
+             config.CHEAP_HEDGE_ASK_MAX) = original
 
 
 def t_broker_records_only_realistic_fills_and_cash():

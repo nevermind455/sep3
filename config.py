@@ -111,9 +111,10 @@ LATE_TRIM_MAX_CLIPS = _env_int("LATE_TRIM_MAX_CLIPS", "2") or 2
 LATE_TRIM_CLIP_MULT = _env_float("LATE_TRIM_CLIP_MULT", "1")
 LATE_TRIM_INTERVAL_SECONDS = _env_float("LATE_TRIM_INTERVAL_SECONDS", "12.0")
 
-# Phase 2 keeps book and Chainlink votes as diagnostics, while fresh Binance
-# SIG PRICE is the sole order-side authority.  It remains off by default;
-# enable it explicitly to run the experimental path.
+# Phase 2 normally keeps book and Chainlink votes as diagnostics, while fresh
+# Binance SIG PRICE is the sole order-side authority. The separately configured
+# price-fallback mode below may use their consensus only while SIG PRICE is
+# missing. Phase 2 remains off by default; enable it explicitly to trade.
 PHASE2_ENABLED = bool(_env_bool("PHASE2_ENABLED", False))
 # PAPER may deliberately follow a later, verified SIG PRICE reversal even
 # after the first outcome token has filled.  LIVE keeps the complement-leg
@@ -157,15 +158,10 @@ ROUND_POLL_SECONDS = _env_float("ROUND_POLL_SECONDS", "5")
 if not 0.5 <= ROUND_POLL_SECONDS <= 30.0:
     raise ValueError("ROUND_POLL_SECONDS must be between 0.5 and 30")
 
-# Phase 2 normally refuses to trade a round unless all four boundary inputs are
-# present: both Binance values and both Chainlink values. But SIG PRICE alone
-# owns the order side, and SIG CHAINLINK is either a diagnostic or - under
-# PHASE2_MULTI_SIGNAL - a leg of its own that can simply abstain. Requiring its
-# inputs to trade cancels rounds that SIG PRICE could have handled: one missed
-# one-second TWAP observation kills five minutes of trading. With this on, only
-# missing BINANCE inputs cancel the round; Chainlink abstains like SIG BOOK
-# already does on a one-sided book. Off by default so the stricter original
-# contract is what you get unless the looser one is chosen deliberately.
+# PHASE2_PARTIAL_SIGNALS normally lets a missing Chainlink diagnostic abstain
+# while Binance remains mandatory. The explicit price-fallback mode below has
+# its own rule: a complete Binance path may trade directly, or a complete
+# Chainlink path may join SIG BOOK only when Binance cannot provide SIG PRICE.
 # Polymarket enables a taker matching delay on these markets (`itode: true` on
 # /clob-markets) but the endpoint states only THAT a delay exists, never how
 # long. An order submitted without knowing it can match after the round has
@@ -209,6 +205,14 @@ PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 # picks ONE side, and multi-signal exists to buy several.
 SIGNAL_MINORITY_RULE = bool(_env_bool("SIGNAL_MINORITY_RULE", False))
 
+# Single-order price-first mode. A usable Binance SIG PRICE always owns the
+# order side. Only when that signal is neutral or unavailable may SIG BOOK and
+# SIG CHAINLINK take over, and then only when both are present and agree. This
+# is deliberately separate from PHASE2_PARTIAL_SIGNALS: permitting a missing
+# diagnostic is not the same risk decision as authorizing a fallback order.
+SIGNAL_PRICE_FALLBACK_COMBINED = bool(_env_bool(
+    "SIGNAL_PRICE_FALLBACK_COMBINED", False))
+
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")
@@ -216,6 +220,17 @@ if SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL:
     raise ValueError(
         "SIGNAL_MINORITY_RULE selects a single dissenting side; it cannot be "
         "combined with PHASE2_MULTI_SIGNAL, which buys one leg per signal")
+if SIGNAL_PRICE_FALLBACK_COMBINED and not PHASE2_ENABLED:
+    raise ValueError(
+        "SIGNAL_PRICE_FALLBACK_COMBINED requires PHASE2_ENABLED=1")
+if SIGNAL_PRICE_FALLBACK_COMBINED and SIGNAL_MINORITY_RULE:
+    raise ValueError(
+        "SIGNAL_PRICE_FALLBACK_COMBINED is price-first and cannot be combined "
+        "with SIGNAL_MINORITY_RULE")
+if SIGNAL_PRICE_FALLBACK_COMBINED and PHASE2_MULTI_SIGNAL:
+    raise ValueError(
+        "SIGNAL_PRICE_FALLBACK_COMBINED selects one order side and cannot be "
+        "combined with PHASE2_MULTI_SIGNAL")
 if PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS:
     raise ValueError(
         "PHASE2_MULTI_SIGNAL and PAPER_ALLOW_SIGNAL_FLIPS both relax the "
@@ -404,7 +419,13 @@ CHEAP_HEDGE_ASK_MIN = _env_float("CHEAP_HEDGE_ASK_MIN", "0.10")
 CHEAP_HEDGE_ASK_MAX = _env_float("CHEAP_HEDGE_ASK_MAX", "0.20")
 CHEAP_HEDGE_START_SECONDS = _env_float("CHEAP_HEDGE_START_SECONDS", "180")
 CHEAP_HEDGE_CUTOFF_SECONDS = _env_float("CHEAP_HEDGE_CUTOFF_SECONDS", "60")
-CHEAP_HEDGE_LOSS_CAP = _env_float("CHEAP_HEDGE_LOSS_CAP", "2.5")
+# Minimum locked profit per matched pair, AFTER both legs' fees, before the
+# hedge may fire. A matched UP+DOWN pair redeems exactly $1.00, so this is
+# literally "how much guaranteed profit per share do I require". Default
+# matches PAIR_LOCK_MIN_EDGE because it is the same question answered by the
+# same arithmetic. Must not be negative: paying a premium for speculative
+# reversal insurance is a different feature, and this one refuses to do it.
+CHEAP_HEDGE_MIN_LOCKED_EDGE = _env_float("CHEAP_HEDGE_MIN_LOCKED_EDGE", "0.02")
 CHEAP_HEDGE_MAX_HEDGE_COST = _env_float("CHEAP_HEDGE_MAX_HEDGE_COST", "3.5")
 CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL = bool(_env_bool(
     "CHEAP_HEDGE_REQUIRE_STRONG_SIGNAL", True))
@@ -425,8 +446,11 @@ if not (math.isfinite(CHEAP_HEDGE_START_SECONDS)
 if (not math.isfinite(CHEAP_HEDGE_MIN_HELD_COST)
         or CHEAP_HEDGE_MIN_HELD_COST < 0.0):
     raise ValueError("CHEAP_HEDGE_MIN_HELD_COST must be non-negative")
-if not math.isfinite(CHEAP_HEDGE_LOSS_CAP) or CHEAP_HEDGE_LOSS_CAP < 0.0:
-    raise ValueError("CHEAP_HEDGE_LOSS_CAP must be non-negative")
+if (not math.isfinite(CHEAP_HEDGE_MIN_LOCKED_EDGE)
+        or not 0.0 <= CHEAP_HEDGE_MIN_LOCKED_EDGE < 1.0):
+    raise ValueError(
+        "CHEAP_HEDGE_MIN_LOCKED_EDGE must be in [0, 1): a negative edge would "
+        "authorize a pair that is a guaranteed loss")
 if (not math.isfinite(CHEAP_HEDGE_MAX_HEDGE_COST)
         or CHEAP_HEDGE_MAX_HEDGE_COST <= 0.0):
     raise ValueError("CHEAP_HEDGE_MAX_HEDGE_COST must be positive")

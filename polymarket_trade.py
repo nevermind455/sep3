@@ -885,7 +885,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
                 condition_id: str | None = None,
                 window_end: float | None = None,
                 max_price: float | None = None, *, pre_submit_guard=None,
-                min_expiry: float | None = None) -> bool:
+                min_expiry: float | None = None,
+                cheap_hedge: bool = False) -> bool:
     """Serialize live submissions so two callers cannot duplicate an entry.
 
     `max_price` caps this order alone, and may only tighten MAX_BUY_PRICE.
@@ -893,6 +894,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
     before each signing/POST boundary.  It may reject, but never changes side.
     `min_expiry` may lower the last-minute floor to LATE_TRIM_CUTOFF_SECONDS
     when late trim is enabled; it cannot open T-0.
+    `cheap_hedge=True` selects the separately configured underdog price band.
+    It is the only order type allowed below the normal MIN_BUY_PRICE floor.
     """
     global last_order_error
     # Wait out a short in-flight balance/cancel HTTP. Failing immediately made
@@ -904,7 +907,8 @@ def place_trade(side: str, amount: float, up_token_id: str | None = None,
         return _place_trade(side, amount, up_token_id, down_token_id,
                             condition_id, window_end, max_price,
                             pre_submit_guard=pre_submit_guard,
-                            min_expiry=min_expiry)
+                            min_expiry=min_expiry,
+                            cheap_hedge=cheap_hedge)
     finally:
         _execution_lock.release()
 
@@ -914,7 +918,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
                  condition_id: str | None = None,
                  window_end: float | None = None,
                  max_price: float | None = None, *, pre_submit_guard=None,
-                 min_expiry: float | None = None) -> bool:
+                 min_expiry: float | None = None,
+                 cheap_hedge: bool = False) -> bool:
     global last_order_error, last_order_status, last_order_receipt, _journal_fault
     last_order_error = None
     last_order_status = None
@@ -979,12 +984,23 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             raise RuntimeError("configured TICK_SIZE disagrees with the current market")
         if config.NEG_RISK is not None and bool(config.NEG_RISK) != rules["neg_risk"]:
             raise RuntimeError("configured NEG_RISK disagrees with the current market")
+        if type(cheap_hedge) is not bool:
+            raise RuntimeError("cheap_hedge must be a boolean")
         ceiling = config.MAX_BUY_PRICE
+        floor_price = config.MIN_BUY_PRICE
+        if cheap_hedge:
+            if not config.CHEAP_HEDGE_ENABLED:
+                raise RuntimeError("cheap hedge price band requested while disabled")
+            # Cheap reversal insurance deliberately lives below the ordinary
+            # entry floor. Keep that exception explicit and scoped to this
+            # order type; regular phase-2 and trim orders retain MIN_BUY_PRICE.
+            ceiling = min(ceiling, config.CHEAP_HEDGE_ASK_MAX)
+            floor_price = config.CHEAP_HEDGE_ASK_MIN
         if max_price is not None:
             # Tighten only: an order cap can never raise the account ceiling.
             ceiling = min(ceiling, float(max_price))
         limit = _round_limit(ceiling, rules["tick"])
-        floor = _round_floor(config.MIN_BUY_PRICE, rules["tick"])
+        floor = _round_floor(floor_price, rules["tick"])
         if floor > limit:
             raise RuntimeError(
                 "the effective price floor is above the order's price cap")

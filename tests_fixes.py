@@ -883,25 +883,36 @@ def _book(ask):
 async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   execution_ready_provider=None,
                                   timeout=0.55, price_votes=None,
+                                  book_votes=None, chainlink_vote="DOWN",
+                                  chainlink_votes=None,
+                                  chainlink_start=100, chainlink_current=101,
                                   diagnostic_side="DOWN",
                                   stop_after_vote=None,
+                                  stop_after_book_vote=None,
                                   stop_after_orders=1,
-                                  allow_signal_flips=False):
+                                  allow_signal_flips=False,
+                                  minority_rule=False,
+                                  price_fallback=False,
+                                  partial_signals=False):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
     active = 1_786_320_000
     seen = {"orders": 0, "probes": 0, "price_votes": 0, "order_sides": [],
-            "executor_guards": []}
+            "book_votes": 0, "chainlink_votes": 0, "executor_guards": []}
     votes = list(price_votes or ())
+    books = list(book_votes or ("DOWN",))
+    chains = list(chainlink_votes or ())
     bids, asks = _book(0.50)
 
     class Strike:
         def strike_for(self, _window):
-            return Decimal("100")
+            return (None if chainlink_start is None
+                    else Decimal(str(chainlink_start)))
 
         def current_value(self):
-            return Decimal("101")
+            return (None if chainlink_current is None
+                    else Decimal(str(chainlink_current)))
 
         def divergence(self, *_a):
             return {"diff": None}
@@ -932,6 +943,20 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         seen["probes"] += 1
         return bids, asks
 
+    def tagged_book_signal(*_args, **_kwargs):
+        index = min(seen["book_votes"], len(books) - 1)
+        seen["book_votes"] += 1
+        vote = books[index]
+        if (stop_after_book_vote is not None
+                and seen["book_votes"] >= stop_after_book_vote):
+            main_bot.stop_event.set()
+        return vote
+
+    def tagged_chainlink_signal(*_args, **_kwargs):
+        index = min(seen["chainlink_votes"], len(chains) - 1)
+        seen["chainlink_votes"] += 1
+        return chains[index]
+
     saved = []
 
     def replace(obj, name, value):
@@ -959,13 +984,15 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             "orderbook_token_id": "11", "condition_id": "0x" + "a" * 64,
         })
         replace(main_bot.orderbook, "get_orderbook", lambda *_a, **_k: (bids, asks))
-        replace(main_bot.orderbook, "liquidity_signal", lambda *_a, **_k: "DOWN")
+        replace(main_bot.orderbook, "liquidity_signal", tagged_book_signal)
         replace(main_bot.orderbook, "validate_buy_liquidity", probe)
-        replace(main_bot.strategy, "decide", lambda *_a, **_k: "DOWN")
+        replace(main_bot.strategy, "decide", lambda *_a, **_k: chainlink_vote)
         replace(main_bot.strategy, "final_decision",
                 lambda *_a, **_k: diagnostic_side)
         if votes:
             replace(main_bot, "price_signal", tagged_price_signal)
+        if chains:
+            replace(main_bot, "chainlink_signal", tagged_chainlink_signal)
         replace(main_bot.price_ws, "latest_snapshot",
                 lambda: (100.0, time.monotonic(), (active + 1) * 1000))
         replace(main_bot.price_ws, "fresh_snapshot",
@@ -980,6 +1007,11 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "MAX_ROUND_EXPOSURE", 100.0)
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
         replace(main_bot.config, "PAPER_ALLOW_SIGNAL_FLIPS", allow_signal_flips)
+        replace(main_bot.config, "SIGNAL_MINORITY_RULE", minority_rule)
+        replace(main_bot.config, "SIGNAL_PRICE_FALLBACK_COMBINED",
+                price_fallback)
+        replace(main_bot.config, "PHASE2_MULTI_SIGNAL", False)
+        replace(main_bot.config, "PHASE2_PARTIAL_SIGNALS", partial_signals)
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(asyncio.TimeoutError):
@@ -1050,6 +1082,90 @@ async def t_phase2_price_signal_is_the_only_order_side_authority():
     check("phase 2 skips stale SIG PRICE immediately before submission",
           submit_stale["orders"] == 0 and submit_stale["price_votes"] >= 3,
           str(submit_stale))
+
+
+async def t_price_first_authority_falls_back_only_when_primary_is_missing():
+    primary = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_fallback=True, price_votes=("UP",) * 8,
+        book_votes=("DOWN",) * 8, chainlink_vote="DOWN")
+    check("usable SIG PRICE wins over an agreeing opposite fallback pair",
+          primary["order_sides"] == ["UP"]
+          and primary["executor_guards"] == [True], str(primary))
+
+    fallback = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_fallback=True, price_votes=(None,) * 8,
+        book_votes=("DOWN",) * 8, chainlink_vote="DOWN")
+    check("missing SIG PRICE follows agreeing BOOK and CHAINLINK",
+          fallback["order_sides"] == ["DOWN"]
+          and fallback["executor_guards"] == [True], str(fallback))
+
+    split = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_fallback=True, price_votes=(None,),
+        book_votes=("DOWN",), chainlink_vote="UP",
+        stop_after_vote=1)
+    check("missing SIG PRICE abstains when BOOK and CHAINLINK disagree",
+          split["orders"] == 0, str(split))
+
+    late_primary = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_fallback=True,
+        price_votes=(None, None, None, "UP"),
+        book_votes=("DOWN",) * 8, chainlink_vote="DOWN")
+    check("a late opposite SIG PRICE cancels the fallback at commit",
+          late_primary["orders"] == 0
+          and late_primary["executor_guards"] == [False],
+          str(late_primary))
+
+
+async def t_minority_rule_is_the_order_authority_at_every_recheck():
+    stable = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        minority_rule=True, price_votes=("UP",) * 8,
+        book_votes=("DOWN",) * 8, chainlink_vote="UP")
+    check("stable BOOK minority can pass every gate and place DOWN",
+          stable["order_sides"] == ["DOWN"]
+          and stable["executor_guards"] == [True], str(stable))
+
+    guard_flip = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        minority_rule=True, price_votes=("UP",) * 8,
+        book_votes=("DOWN",) * 8,
+        chainlink_votes=("UP", "UP", "UP", "DOWN"))
+    check("commit guard rejects a minority flip during modeled latency",
+          guard_flip["orders"] == 0
+          and guard_flip["executor_guards"] == [False], str(guard_flip))
+
+    changed = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        minority_rule=True, price_votes=("UP",) * 8,
+        book_votes=("UP", "DOWN", "DOWN"), chainlink_vote="UP",
+        stop_after_book_vote=2)
+    check("a final minority flip aborts instead of submitting the old side",
+          changed["orders"] == 0 and changed["book_votes"] >= 2,
+          str(changed))
+
+    restarted = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: {"11"},
+        minority_rule=True, price_votes=("UP",) * 8,
+        book_votes=("DOWN",) * 8, chainlink_vote="UP",
+        allow_signal_flips=True)
+    check("restart cannot treat its first minority sample as a verified flip",
+          restarted["orders"] == 0, str(restarted))
+
+
+async def t_partial_signals_are_honoured_by_final_rechecks():
+    partial = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        minority_rule=True, partial_signals=True,
+        price_votes=("DOWN",) * 8,
+        book_votes=("DOWN",) * 8, chainlink_vote=None,
+        chainlink_start=None, chainlink_current=None)
+    check("missing Chainlink may abstain through submission in partial mode",
+          partial["order_sides"] == ["DOWN"]
+          and partial["executor_guards"] == [True], str(partial))
 
 
 async def t_paper_signal_flip_mode_keeps_repeats_and_allows_verified_flip():
@@ -1174,8 +1290,18 @@ def t_submission_path_revalidates_every_signal_and_latency():
           "submit_cl = current_chainlink_twap()" in source)
     check("submission path revalidates the book decision",
           "final_book_side = orderbook.liquidity_signal" in source)
-    check("submission path refuses a changed fresh price signal",
-          "if submit_price_side != side:" in source)
+    check("submission path refuses a changed configured decision",
+          "if submit_authority_side != side:" in source)
+    final_diag = source.index(
+        "_final_diagnostic_side = strategy.final_decision(")
+    final_authority = source.index(
+        "final_authority_side = _authority_side(")
+    submit_diag = source.index(
+        "_submit_diagnostic_side = strategy.final_decision(")
+    submit_authority = source.index(
+        "submit_authority_side = _authority_side(")
+    check("dashboard decision probe ends on the configured authority",
+          final_diag < final_authority and submit_diag < submit_authority)
     check("phase 2 performs an immediate price-side submission gate",
           source.count("submit_price_side = price_signal(") == 1,
           str(source.count("submit_price_side = price_signal(")))

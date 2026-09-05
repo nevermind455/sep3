@@ -591,6 +591,25 @@ def _install_locked(state: TerminalState, mirror_path: str | None = None):
         return inner
     _patch(strategy, "minority_decision", wrap_minority)
 
+    # main_bot resolves the actual execution authority only after publishing
+    # its diagnostic vote. Probe that final resolver as well so the dashboard
+    # and cheap-hedge loop see SIG PRICE in price-first mode, or the explicit
+    # Book+Chainlink fallback only while SIG PRICE is absent.
+    def wrap_authority(orig):
+        def inner(price_side, book_side, chainlink_side):
+            out = orig(price_side, book_side, chainlink_side)
+            try:
+                with state.lock():
+                    if (state.round_key is not None
+                            and state.strategy_round_key == state.round_key):
+                        state.decision.set(out)
+                        state.decision_forced = False
+            except Exception as exc:
+                _telemetry_failed(state, "authority probe", exc)
+            return out
+        return inner
+    _patch(main_bot, "_authority_side", wrap_authority)
+
     # ---- market discovery ------------------------------------------------
     def wrap_tokens(orig):
         def inner(*a, **kw):

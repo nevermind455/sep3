@@ -177,6 +177,75 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
         return False
 
 
+def _fresh_authority_permit(round_key: int, start_price,
+                            start_chainlink_price, book_side,
+                            expected_side: str, *, signal_observer=None) -> bool:
+    """Revalidate the configured phase-2 decision at the commit boundary.
+
+    Normal mode remains price-authoritative and keeps the established guard.
+    Price-fallback mode accepts a Book+Chainlink consensus only while fresh
+    SIG PRICE is unavailable. Minority mode recomputes the dissenting side.
+
+    The Book vote is the snapshot validated immediately before ``place_trade``.
+    A REST read inside the broker's ledger lock would age the already-built FOK
+    quote and leave it unvalidated, so only the in-memory price legs are sampled
+    again inside this final callback.
+    """
+    price_fallback = config.SIGNAL_PRICE_FALLBACK_COMBINED
+    if not config.SIGNAL_MINORITY_RULE and not price_fallback:
+        return _fresh_price_permit(
+            round_key, start_price, expected_side,
+            signal_observer=signal_observer)
+    if (expected_side not in ("UP", "DOWN")
+            or (config.SIGNAL_MINORITY_RULE and start_price is None)):
+        return False
+
+    def observe(side):
+        if signal_observer is not None:
+            signal_observer(side)
+
+    try:
+        sampled_wall = timer.unix()
+        if timer.window_start(sampled_wall) != round_key:
+            observe(None)
+            return False
+        current_price, current_ts_ms = price_ws.fresh_snapshot(
+            config.BTC_STALE_AFTER)
+        price_sample_ready = (
+            start_price is not None and current_price is not None
+            and current_ts_ms is not None
+            and timer.window_start(float(current_ts_ms) / 1000.0) == round_key)
+        if not price_sample_ready and not price_fallback:
+            observe(None)
+            return False
+        price_side = (price_signal(round_key, start_price, current_price)
+                      if price_sample_ready else None)
+        if price_side is None and not price_fallback:
+            observe(None)
+            return False
+
+        current_chainlink = current_chainlink_twap()
+        chainlink_side = chainlink_signal(
+            round_key, start_chainlink_price, current_chainlink)
+        if (config.SIGNAL_MINORITY_RULE and current_chainlink is None
+                and not config.PHASE2_PARTIAL_SIGNALS):
+            observe(None)
+            return False
+        if price_fallback and price_side is None and chainlink_side is None:
+            observe(None)
+            return False
+        authority_side = _authority_side(
+            price_side, book_side, chainlink_side)
+        observe(authority_side)
+        return authority_side == expected_side
+    except (TypeError, ValueError, OverflowError):
+        try:
+            observe(None)
+        except Exception:
+            pass
+        return False
+
+
 def _late_trim_amount() -> float:
     from decimal import Decimal
     value = (Decimal(str(config.BET_SIZE))
@@ -402,7 +471,7 @@ def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
 
 
 class _RoundSignalEpoch:
-    """Track accepted direction against observed non-neutral SIG PRICE runs.
+    """Track accepted direction against observed non-neutral authority runs.
 
     The epoch advances on the first usable side and on every later UP/DOWN
     transition.  Neutral or missing samples never manufacture a transition.
@@ -484,14 +553,22 @@ class _RoundSignalEpoch:
 def _authority_side(price_side, book_side, chainlink_side):
     """The signal that actually decides the order side under this config.
 
-    The round epoch has to track whatever drives execution. Under the minority
-    rule the decision can flip because BOOK or CHAINLINK moved while SIG PRICE
-    stood still, and an epoch watching SIG PRICE alone would call that "no
-    transition" - refusing the very complement the flip was supposed to buy.
+    The round epoch has to track whatever drives execution. That may be the
+    explicit minority experiment, normal SIG PRICE, or (only while SIG PRICE
+    is absent) the configured BOOK+CHAINLINK consensus fallback.
     """
     if config.SIGNAL_MINORITY_RULE:
         return strategy.minority_decision(price_side, book_side, chainlink_side)
-    return price_side
+    if price_side in ("UP", "DOWN"):
+        return price_side
+    if config.SIGNAL_PRICE_FALLBACK_COMBINED:
+        # With the primary signal absent, two independent fallback votes must
+        # agree. A 1-1 split is not a combined direction and cannot authorize
+        # an order merely because one source happened to be checked first.
+        if (book_side in ("UP", "DOWN")
+                and chainlink_side == book_side):
+            return book_side
+    return None
 
 
 stop_event = threading.Event()
@@ -890,12 +967,20 @@ async def run_bot():
                 missing.append("Chainlink boundary TWAP")
             if current_cl is None:
                 missing.append("fresh Chainlink TWAP")
-            # SIG PRICE owns the order side, so only its inputs can genuinely
-            # cancel a round. Chainlink's absence used to cancel one too, which
-            # meant a single dropped one-second TWAP observation cost five
-            # minutes of trading even though SIG PRICE was ready the whole time.
             blocking = missing
-            if config.PHASE2_PARTIAL_SIGNALS:
+            if config.SIGNAL_PRICE_FALLBACK_COMBINED:
+                # Either complete path is enough: Binance owns the side when
+                # available; otherwise Chainlink plus the Book vote (read
+                # below) may form the explicit fallback consensus.
+                binance_missing = [item for item in missing
+                                    if "Binance" in item]
+                chainlink_missing = [item for item in missing
+                                      if "Chainlink" in item]
+                blocking = (binance_missing + chainlink_missing
+                            if binance_missing and chainlink_missing else [])
+            elif config.PHASE2_PARTIAL_SIGNALS:
+                # In ordinary price-authority mode Chainlink is diagnostic and
+                # may abstain; Binance remains mandatory.
                 blocking = [item for item in missing if "Binance" in item]
                 abstaining = [item for item in missing if item not in blocking]
                 if abstaining and not blocking and skip_logged_window != active_window:
@@ -967,9 +1052,6 @@ async def run_bot():
             )
 
             price_side = price_signal(active_window, start_price, lp)
-            if not config.SIGNAL_MINORITY_RULE:
-                signal_epoch.observe(price_side)
-            signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             book_side = None
             chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, current_cl)
@@ -983,36 +1065,41 @@ async def run_bot():
 
             diagnostic_side = strategy.final_decision(
                 price_side, book_side, chainlink_side)
-            if price_side is None:
+            if (price_side is None
+                    and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
                 print(f"{_ts()} [RISK] No order: fresh SIG PRICE is neutral or unavailable.")
                 await asyncio.sleep(0.2)
                 continue
-            # Book and Chainlink remain visible diagnostics.  They may confirm
-            # SIG PRICE, but they can never override the side sent to execution.
-            #
-            # Under SIGNAL_MINORITY_RULE they DO decide it: the order follows
-            # whichever side is outvoted. The fresh-SIG-PRICE gate above still
-            # runs first, so a stale or neutral price feed refuses the round
-            # either way - only the choice of side moves, never the decision
-            # about whether it is safe to trade at all.
-            if config.SIGNAL_MINORITY_RULE:
-                side = strategy.minority_decision(
-                    price_side, book_side, chainlink_side)
-                # Track the decision, not SIG PRICE: this is what a later flip
-                # has to differ from for the complement to be permitted.
-                signal_epoch.observe(side)
-                if side is None:
+            # Resolve the configured authority after publishing the diagnostic
+            # vote. SIG PRICE wins whenever it speaks. The fallback is reachable
+            # only when it does not, and requires Book + Chainlink agreement.
+            side = _authority_side(price_side, book_side, chainlink_side)
+            signal_epoch.observe(side)
+            if side is None:
+                if config.SIGNAL_PRICE_FALLBACK_COMBINED:
+                    print(f"{_ts()} [RISK] No order: SIG PRICE is unavailable and "
+                          "SIG BOOK + SIG CHAINLINK do not agree on a fallback.")
+                elif config.SIGNAL_MINORITY_RULE:
                     print(f"{_ts()} [RISK] No order: signals are tied or "
                           f"unanimous-neutral, so there is no minority side.")
-                    await asyncio.sleep(0.2)
-                    continue
-            else:
-                side = price_side
+                else:
+                    print(f"{_ts()} [RISK] No order: no configured signal authority.")
+                await asyncio.sleep(0.2)
+                continue
+            # Anchor restart recovery only after the configured authority has
+            # been observed. Doing this earlier in minority mode made the first
+            # post-restart sample look like a verified signal flip and could
+            # authorize the complementary leg immediately.
+            signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
 
+            authority_source = (
+                "MINORITY" if config.SIGNAL_MINORITY_RULE else
+                "SIG PRICE" if price_side in ("UP", "DOWN") else
+                "BOOK+CHAINLINK FALLBACK")
             print(
                 f"{_ts()} [SIGNAL] price={price_side} book={book_side or 'n/a'} "
                 f"chainlink={chainlink_side} -> diagnostic={diagnostic_side or 'n/a'} "
-                f"ORDER SIDE={side}"
+                f"authority={authority_source} ORDER SIDE={side}"
             )
 
             entry_ceiling = config.entry_cost_ceiling(config.MAX_BUY_PRICE)
@@ -1069,7 +1156,11 @@ async def run_bot():
             validation_started = time.monotonic()
             final_lp, _final_lp_ts = price_ws.fresh_snapshot(config.BTC_STALE_AFTER)
             final_cl = current_chainlink_twap()
-            if final_lp is None or final_cl is None:
+            if ((final_lp is None
+                 and not config.SIGNAL_PRICE_FALLBACK_COMBINED)
+                    or (final_cl is None
+                        and not config.PHASE2_PARTIAL_SIGNALS
+                        and not config.SIGNAL_PRICE_FALLBACK_COMBINED)):
                 print(f"{_ts()} [RISK] No order: a price feed became stale during validation.")
                 await asyncio.sleep(0.2)
                 continue
@@ -1087,18 +1178,26 @@ async def run_bot():
             final_price_side = price_signal(active_window, start_price, final_lp)
             final_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, final_cl)
-            signal_epoch.observe(_authority_side(
-                final_price_side, final_book_side, final_chainlink_side))
             _final_diagnostic_side = strategy.final_decision(
                 final_price_side, final_book_side, final_chainlink_side)
-            if final_price_side is None:
+            final_authority_side = _authority_side(
+                final_price_side, final_book_side, final_chainlink_side)
+            if (final_price_side is None
+                    and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
+                signal_epoch.observe(None)
                 print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
                 await asyncio.sleep(0.2)
                 continue
-            if final_price_side != side:
+            signal_epoch.observe(final_authority_side)
+            if final_authority_side is None:
+                print(f"{_ts()} [RISK] No order: deciding signals became tied or "
+                      "unavailable during validation.")
+                await asyncio.sleep(0.2)
+                continue
+            if final_authority_side != side:
                 print(
-                    f"{_ts()} [RISK] No order: SIG PRICE changed during validation "
-                    f"({side} -> {final_price_side})."
+                    f"{_ts()} [RISK] No order: configured decision changed during "
+                    f"validation ({side} -> {final_authority_side})."
                 )
                 await asyncio.sleep(0.2)
                 continue
@@ -1347,7 +1446,11 @@ async def run_bot():
 
             submit_lp, _submit_lp_ts = price_ws.fresh_snapshot(config.BTC_STALE_AFTER)
             submit_cl = current_chainlink_twap()
-            if submit_lp is None or submit_cl is None:
+            if ((submit_lp is None
+                 and not config.SIGNAL_PRICE_FALLBACK_COMBINED)
+                    or (submit_cl is None
+                        and not config.PHASE2_PARTIAL_SIGNALS
+                        and not config.SIGNAL_PRICE_FALLBACK_COMBINED)):
                 print(f"{_ts()} [RISK] No order: a price feed went stale before submission.")
                 await asyncio.sleep(0.2)
                 continue
@@ -1356,19 +1459,28 @@ async def run_bot():
                 if side == "UP" else final_book_side
             )
             submit_price_side = price_signal(active_window, start_price, submit_lp)
-            signal_epoch.observe(submit_price_side)
             submit_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, submit_cl)
             _submit_diagnostic_side = strategy.final_decision(
                 submit_price_side, submit_book_side, submit_chainlink_side)
-            if submit_price_side is None:
+            submit_authority_side = _authority_side(
+                submit_price_side, submit_book_side, submit_chainlink_side)
+            if (submit_price_side is None
+                    and not config.SIGNAL_PRICE_FALLBACK_COMBINED):
+                signal_epoch.observe(None)
                 print(f"{_ts()} [RISK] No order: SIG PRICE is neutral immediately before submission.")
                 await asyncio.sleep(0.2)
                 continue
-            if submit_price_side != side:
+            signal_epoch.observe(submit_authority_side)
+            if submit_authority_side is None:
+                print(f"{_ts()} [RISK] No order: deciding signals are tied or "
+                      "unavailable immediately before submission.")
+                await asyncio.sleep(0.2)
+                continue
+            if submit_authority_side != side:
                 print(
-                    f"{_ts()} [RISK] No order: SIG PRICE changed immediately before "
-                    f"submission ({side} -> {submit_price_side})."
+                    f"{_ts()} [RISK] No order: configured decision changed immediately "
+                    f"before submission ({side} -> {submit_authority_side})."
                 )
                 await asyncio.sleep(0.2)
                 continue
@@ -1408,8 +1520,9 @@ async def run_bot():
             ok = await asyncio.to_thread(
                 place_trade, side, config.BET_SIZE, up_id, down_id,
                 tokens["condition_id"], round_end,
-                pre_submit_guard=lambda: _fresh_price_permit(
-                    active_window, start_price, side,
+                pre_submit_guard=lambda: _fresh_authority_permit(
+                    active_window, start_price, start_chainlink_price,
+                    submit_book_side, side,
                     signal_observer=signal_epoch.observe))
             if ok:
                 round_exposure += entry_ceiling

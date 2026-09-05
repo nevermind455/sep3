@@ -25,17 +25,22 @@ def check(label: str, cond: bool, detail: str = "") -> None:
     print(f"{prefix} {label}{tail}")
 
 
+# Held 40 DOWN shares for $24 all-in = 0.60/share. Underdog UP at 0.12.
+#   hedge fee/share = 0.07 * 0.12 * 0.88          = 0.00739
+#   locked/pair     = 1 - (0.60 + 0.12 + 0.00739) = +0.2726
+# Comfortably above the 0.02 default edge, so this pair fires.
 BASE = dict(
     enabled=True,
-    remaining=120.0,          # inside default 60-180 window
+    remaining=120.0,          # inside the 60-180 window
     start=180.0,
     cutoff=60.0,
     up_shares=0.0, up_cost=0.0,
-    down_shares=40.0, down_cost=24.0,     # held DOWN, $24 cost
+    down_shares=40.0, down_cost=24.0,     # held DOWN, $24 all-in, 0.60/sh
     up_ask=0.12, down_ask=0.85,           # UP is the cheap underdog
     ask_min=0.10, ask_max=0.15,
     min_held_cost=15.0,
-    loss_cap=10.0,
+    fee_rate=0.07,
+    min_locked_edge=0.02,
     max_hedge_cost=3.50,
     current_traded_side="DOWN",           # strategy still trading held side
     require_strong_signal=True,
@@ -50,15 +55,23 @@ def t_happy_path_fires_buy_on_underdog():
           str(d))
     check("held side reported as DOWN", d["held_side"] == "DOWN", str(d))
     check("ask reported as underdog ask", d["ask"] == 0.12, str(d))
-    # target recovery = held_cost - loss_cap = 24 - 10 = 14
-    # shares_needed = 14 / (1 - 0.12) = 15.909
-    # hedge_cost = 15.909 * 0.12 = 1.909
-    check("hedge_cost sized to cap loss at ~$10",
-          abs(d["amount"] - 1.909) < 0.01, str(d["amount"]))
+    check("held all-in per share is cost/shares",
+          abs(d["held_all_in"] - 0.60) < 1e-9, str(d["held_all_in"]))
+    # locked = 1 - (0.60 + 0.12 + 0.07*0.12*0.88) = 0.27261
+    check("locked/pair computed with BOTH legs' fees",
+          abs(d["locked_per_pair"] - 0.27261) < 1e-4,
+          str(d["locked_per_pair"]))
+    # full match wants 40 shares * 0.12 = $4.80, clamped to max_hedge_cost 3.50
+    check("sizing targets a FULL match before the clamp",
+          abs(d["hedge_cost_uncapped"] - 4.80) < 1e-9,
+          str(d["hedge_cost_uncapped"]))
+    check("spend clamped to max_hedge_cost",
+          abs(d["amount"] - 3.50) < 1e-9, str(d["amount"]))
     check("shares match hedge_cost / ask",
           abs(d["shares"] - d["amount"] / 0.12) < 1e-6, str(d))
     check("max_price is ASK_MAX (never above)",
           d["max_price"] == 0.15, str(d))
+    check("reason names the mechanism", d["reason"] == "locked pair", str(d))
 
 
 def t_off_when_disabled():
@@ -164,26 +177,58 @@ def t_minority_rule_scenario_now_permits_hedge():
           d["action"] == "buy" and d["side"] == "UP", str(d))
 
 
-def t_held_cost_already_within_cap():
-    # held cost 8 <= loss cap 10; nothing to insure
-    d = evaluate_cheap_hedge(**{**BASE, "down_cost": 8.0,
+def t_losing_pair_is_refused():
+    # Held 40 sh for $34 all-in = 0.85/share. Underdog at 0.12 plus its fee
+    # makes the pair 0.85 + 0.12 + 0.0074 = 0.9774 -> locks only +0.0226.
+    # Push the entry to 0.90/share and the pair goes underwater.
+    d = evaluate_cheap_hedge(**{**BASE, "down_cost": 36.0,
                                 "min_held_cost": 0.0})
-    check("held cost within loss cap refuses",
-          d["action"] == "skip" and "loss cap" in d["reason"],
+    # all-in 0.90 -> locked = 1 - (0.90 + 0.12 + 0.00739) = -0.0274
+    check("pair that would lose after fees is refused",
+          d["action"] == "skip" and "pair locks" in d["reason"], str(d))
+    check("locked/pair is reported even on refusal",
+          d["locked_per_pair"] is not None and d["locked_per_pair"] < 0,
+          str(d["locked_per_pair"]))
+
+
+def t_thin_edge_below_minimum_is_refused():
+    # all-in 0.85 -> locked = 1 - (0.85 + 0.12 + 0.00739) = +0.0226.
+    # Positive, but demand a 0.05 edge and it must still refuse.
+    d = evaluate_cheap_hedge(**{**BASE, "down_cost": 34.0,
+                                "min_held_cost": 0.0,
+                                "min_locked_edge": 0.05})
+    check("locked edge below the required minimum refuses",
+          d["action"] == "skip" and "needs 0.0500" in d["reason"], str(d))
+    check("same pair fires when the minimum is lowered",
+          evaluate_cheap_hedge(**{**BASE, "down_cost": 34.0,
+                                  "min_held_cost": 0.0,
+                                  "min_locked_edge": 0.02})["action"] == "buy")
+
+
+def t_zero_shares_refused():
+    d = evaluate_cheap_hedge(**{**BASE, "down_shares": 0.0,
+                                "min_held_cost": 0.0})
+    check("held cost with no shares cannot be matched",
+          d["action"] == "skip" and "no shares to match" in d["reason"],
           str(d))
 
 
 def t_hedge_cost_clamped_by_max():
-    # Very high held cost; uncapped hedge would exceed MAX_HEDGE_COST.
-    d = evaluate_cheap_hedge(**{**BASE, "down_cost": 60.0, "loss_cap": 5.0})
-    # uncapped: (60-5)/(1-0.12) = 62.5; hedge_cost = 62.5*0.12 = 7.5
-    # capped at MAX_HEDGE_COST=3.50
+    # 40 held shares at a full match costs 40 * 0.12 = $4.80, above the
+    # $3.50 ceiling, so the spend clamps but the hedge still fires.
+    d = evaluate_cheap_hedge(**BASE)
     check("hedge_cost capped at max_hedge_cost",
           abs(d["amount"] - 3.50) < 1e-9, str(d["amount"]))
     check("hedge still fires despite the clamp",
           d["action"] == "buy", str(d))
-    check("uncapped cost reported for observability",
-          d["hedge_cost_uncapped"] > d["amount"], str(d))
+    check("uncapped (full-match) cost reported for observability",
+          abs(d["hedge_cost_uncapped"] - 4.80) < 1e-9, str(d))
+    # Raise the ceiling and the full match goes through untouched.
+    full = evaluate_cheap_hedge(**{**BASE, "max_hedge_cost": 10.0})
+    check("with headroom it buys the full match",
+          abs(full["amount"] - 4.80) < 1e-9, str(full["amount"]))
+    check("full match means one hedge share per held share",
+          abs(full["shares"] - 40.0) < 1e-6, str(full["shares"]))
 
 
 def t_underdog_priced_at_or_above_1():

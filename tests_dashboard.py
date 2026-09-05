@@ -745,6 +745,59 @@ def test_absent_are_absent_not_disconnected() -> None:
     check("binance starts WAIT not OK", h["BINANCE WS"] == "WAIT", h["BINANCE WS"])
 
 
+def test_active_dashboard_keyboard_controls() -> None:
+    """The controls printed in the footer must reach the hardened runner."""
+    import threading
+
+    import main_bot
+    import run_feeds
+    from dashboard import Keys
+    from run_terminal import Keys as TerminalKeys
+
+    class QueuedKeys:
+        def __init__(self, *values):
+            self.values = list(values)
+
+        def pop(self):
+            values, self.values = self.values, []
+            return values
+
+    class FakeRenderer:
+        def __init__(self):
+            self.repaints = 0
+
+        def repaint(self):
+            self.repaints += 1
+
+    check("terminal and hardened runners share one key reader",
+          Keys is TerminalKeys)
+
+    renderer = FakeRenderer()
+    local_stop = threading.Event()
+    was_stopped = main_bot.stop_event.is_set()
+    try:
+        main_bot.stop_event.clear()
+        quit_requested = run_feeds._handle_dashboard_keys(
+            QueuedKeys("r"), renderer, local_stop)
+        check("r requests an immediate repaint",
+              not quit_requested and renderer.repaints == 1
+              and not local_stop.is_set() and not main_bot.stop_event.is_set())
+
+        for key, label in (("q", "q"), ("Q", "Q"), ("\r", "Enter")):
+            local_stop.clear()
+            main_bot.stop_event.clear()
+            quit_requested = run_feeds._handle_dashboard_keys(
+                QueuedKeys(key), renderer, local_stop)
+            check(f"{label} gracefully stops the active dashboard runner",
+                  quit_requested and local_stop.is_set()
+                  and main_bot.stop_event.is_set())
+    finally:
+        if was_stopped:
+            main_bot.stop_event.set()
+        else:
+            main_bot.stop_event.clear()
+
+
 def test_staleness_marks_rather_than_hides() -> None:
     st = populated()
     st.spot_changed.at -= 30.0          # simulate a silent feed
@@ -860,7 +913,18 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # LOSS_CAP 10.0 -> 2.5 so target_recovery stays positive at that cost.
     # Invariant MIN_HELD_COST > LOSS_CAP is preserved; the decision module
     # (cheap_hedge.py) is not touched.
-    "config.py": "5842b04a47ca1dbefa851853b3d29a58c29c3196f092eacfc578e16a82641f59",
+    # Re-approved 2026-09-05: added SIGNAL_PRICE_FALLBACK_COMBINED (off by
+    # default). Price-first single-order mode: SIG PRICE owns the side
+    # whenever usable; only when it is absent may SIG BOOK + SIG CHAINLINK
+    # authorize, and only when both are present and agree. Guarded as
+    # mutually exclusive with SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL,
+    # and requires PHASE2_ENABLED=1.
+    # Re-approved 2026-09-05: CHEAP_HEDGE_LOSS_CAP replaced by
+    # CHEAP_HEDGE_MIN_LOCKED_EDGE. The hedge no longer sizes against a target
+    # loss floor; it refuses unless the finished pair locks at least that much
+    # profit per share after BOTH legs' fees, then sizes toward a full match.
+    # Validated to [0, 1) so a negative edge cannot authorize a losing pair.
+    "config.py": "95e96e8d51c309fb046d4afedaacf9f2049d7de01dd450621891da52c0840740",
     # Re-approved 2026-08-25: restart restores durable held-token legs before
     # both phase paths can buy the complementary outcome, and LIVE rechecks a
     # sent, heartbeat-proven private fill subscription before each submission.
@@ -876,7 +940,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # T-60..T-20 may place 1-2 FOKs of the red 0.80-0.88 favorite; normal
     # entries still use MIN_SECONDS_TO_EXPIRY.
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only.
-    "main_bot.py": "aa4ea3b48aba541ab14bfc9817d66406695083f2050afd67866d53c1bedc16ca",
+    # Re-approved 2026-09-05: minority mode now revalidates its configured
+    # three-signal authority at every gate (including executor commit), anchors
+    # restart epochs after that authority is observed, and keeps an explicitly
+    # partial Chainlink signal optional through final submission checks.
+    # Re-approved 2026-09-05: phase 2 resolves its side through
+    # _authority_side in every mode, and the executor-commit guard becomes
+    # _fresh_authority_permit so the revalidated signal matches the one that
+    # chose the side. Normal mode still delegates to _fresh_price_permit and
+    # is unchanged. initialize_from_durable now runs after the first authority
+    # observation so a restart cannot look like a verified flip.
+    "main_bot.py": "dbe668c3fa9c5c511d4041277e5d48e4a8cb942504f907dff324bc23dc2c705f",
     # Re-approved 2026-08-25: discovery now rejects any market whose venue
     # config is not explicitly BTC / 5m / enabled 60-second TWAP.
     # Re-approved 2026-09-04: CRLF/LF line-ending normalisation only; git
@@ -911,7 +985,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # (the second-defined won and silently shadowed the first) and dropped
     # the now-redundant bool() coercion. Kept value is what the SDK returns
     # for that field. No decision-path change.
-    "polymarket_trade.py": "ad333edf2a51b7b10d12e619083b7819dc208ba841f702d97ff934f65d352671",
+    # Re-approved 2026-09-05: an explicit cheap_hedge order type uses only
+    # CHEAP_HEDGE_ASK_MIN..ASK_MAX. Normal entries still enforce the account
+    # MIN_BUY_PRICE, so reversal insurance can trade its intended underdog
+    # band without weakening the ordinary entry floor.
+    "polymarket_trade.py": "83ab4643befdb2629d061b240462be17c8961c7d45267b9219d0c9f4391e7952",
     # Re-approved 2026-09-04: line-ending normalisation only (CRLF on
     # disk vs LF blob after checkout). git diff shows no semantic change.
     "price_ws.py": "c9c501942855e5448b7659dc1fac333a729cbaedbefb95a07c24fee02c13ad25",
@@ -989,6 +1067,42 @@ def test_decisions_identical_after_probe() -> None:
         sys.stdout = real_stdout
 
     check("uninstall restores strategy", _truth_tables(strategy) == before)
+
+
+def test_probe_displays_the_configured_price_first_authority() -> None:
+    os.environ.setdefault("POLY_PRIVATE_KEY", "0x" + "1" * 64)
+    import main_bot
+    from dashboard import probe
+
+    st = TerminalState()
+    st.set_round_context(300, "ROUND A", 200)
+    st.mark_strategy_round(300)
+    old_minority = main_bot.config.SIGNAL_MINORITY_RULE
+    old_fallback = main_bot.config.SIGNAL_PRICE_FALLBACK_COMBINED
+    real_stdout = probe.install(st)
+    try:
+        main_bot.config.SIGNAL_MINORITY_RULE = False
+        main_bot.config.SIGNAL_PRICE_FALLBACK_COMBINED = True
+
+        chosen = main_bot._authority_side("UP", "DOWN", "DOWN")
+        check("dashboard authority keeps a usable SIG PRICE primary",
+              chosen == "UP" and st.decision.value == "UP",
+              str((chosen, st.decision.value)))
+
+        chosen = main_bot._authority_side(None, "DOWN", "DOWN")
+        check("dashboard authority shows the agreeing combined fallback",
+              chosen == "DOWN" and st.decision.value == "DOWN",
+              str((chosen, st.decision.value)))
+
+        chosen = main_bot._authority_side(None, "UP", "DOWN")
+        check("dashboard authority clears a split fallback decision",
+              chosen is None and st.decision.value is None,
+              str((chosen, st.decision.value)))
+    finally:
+        main_bot.config.SIGNAL_MINORITY_RULE = old_minority
+        main_bot.config.SIGNAL_PRICE_FALLBACK_COMBINED = old_fallback
+        probe.uninstall()
+        sys.stdout = real_stdout
 
 
 def test_probe_survives_telemetry_failure() -> None:
